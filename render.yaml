@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: groupe-saba-securite
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 2 -b 0.0.0.0:$PORT app:app
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: SECRET_KEY
+        generateValue: true
+      - key: SETUP_KEY
+        generateValue: true
+      - key: COOKIE_SECURE
+        value: '1'
+      - key: DATABASE_PATH
+        value: /var/data/saba.sqlite3
+    disk:
+      name: saba-data
+      mountPath: /var/data
+      sizeGB: 1

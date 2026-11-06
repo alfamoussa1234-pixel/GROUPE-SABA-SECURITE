@@ -1,1 +1,9 @@
-{% extends 'base.html' %}{% block body %}<section class="card login"><h1>Connexion sécurisée</h1><p class="muted">Accédez aux visites et rapports de GROUPE SABA SÉCURITÉ.</p><form method="post"><input type="hidden" name="csrf" value="{{csrf_token()}}"><div class="field"><label>Identifiant</label><input name="username" autocomplete="username" required autofocus></div><div class="field"><label>Mot de passe</label><input name="password" type="password" autocomplete="current-password" required></div><button class="btn">Se connecter</button></form></section>{% endblock %}
+{% extends 'base.html' %}{% block body %}<section class="card login">
+  <div style="text-align:center; margin-bottom:20px;">
+    <img
+      src="{{ url_for('static', filename='SABA O.png') }}"
+      alt="Logo GROUPE SABA SÉCURITÉ"
+      style="width:220px; max-width:100%; height:auto;"
+    >
+  </div>
+  <h1>Connexion sécurisée</h1><p class="muted">Accédez aux visites et rapports de GROUPE SABA SÉCURITÉ.</p><form method="post"><input type="hidden" name="csrf" value="{{csrf_token()}}"><div class="field"><label>Identifiant</label><input name="username" autocomplete="username" required autofocus></div><div class="field"><label>Mot de passe</label><input name="password" type="password" autocomplete="current-password" required></div><button class="btn">Se connecter</button></form></section>{% endblock %}

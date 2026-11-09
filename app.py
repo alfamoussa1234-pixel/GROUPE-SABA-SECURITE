@@ -1,4 +1,4 @@
-import os, sqlite3, secrets, csv, io
+import os, sqlite3, secrets, csv, io, json
 from datetime import datetime, date
 from functools import wraps
 from flask import Flask, request, session, redirect, url_for, flash, render_template, Response, abort
@@ -214,22 +214,40 @@ def site_edit(sid):
         except sqlite3.IntegrityError:flash('Code déjà utilisé.','danger')
     return render_template('site_edit.html',s=s,zones=all_zones())
 
+def create_visit_records(form):
+    site_ids=form.getlist('site_ids') or [form.get('site_id','')]
+    if not 1<=len(site_ids)<=100 or any(not x.isdigit() for x in site_ids):
+        raise ValueError('Sélectionnez de 1 à 100 sites valides.')
+    ids=list(dict.fromkeys(map(int,site_ids)))
+    if len(ids)!=len(site_ids):raise ValueError('Un site est coché plusieurs fois.')
+    try:date.fromisoformat(form.get('visit_date',''))
+    except ValueError:raise ValueError('Date invalide.')
+    effected=form.get('effected','1')
+    if effected not in ('0','1'):raise ValueError('État de visite invalide.')
+    obs=form.get('observations','').strip()
+    ctl=form.get('controleur','').strip() or current()['username']
+    if len(obs)>10000 or len(ctl)>200:raise ValueError('Texte trop long.')
+    with conn() as c:
+        ph=','.join('?' for _ in ids)
+        n=c.execute(f"SELECT COUNT(*) FROM sites WHERE id IN ({ph}) AND situation='ACTIF'",ids).fetchone()[0]
+        if n!=len(ids):raise ValueError('Site inconnu ou inactif.')
+        for sid in ids:
+            cur=c.execute('INSERT INTO visits(site_id,visit_date,controleur,effected,observations,created_by,created_at) VALUES(?,?,?,?,?,?,?)',
+                (sid,form['visit_date'],ctl,int(effected),obs,current()['id'],datetime.now().isoformat(timespec='seconds')))
+            log(c,'CREATE','visit',cur.lastrowid,'Déclaration multiple' if len(ids)>1 else '')
+    return len(ids)
+
 @app.route('/visits',methods=['GET','POST'])
 @login_required
 def visits():
     if request.method=='POST':
         if current()['role']=='lecture':abort(403)
-        sid=request.form.get('site_id','');when=request.form.get('visit_date','')
-        if not sid.isdigit() or not one('SELECT id FROM sites WHERE id=?',(sid,)):
-            flash('Sélectionnez un site existant.','danger')
+        try:
+            count=create_visit_records(request.form)
+        except ValueError as e:flash(str(e),'danger')
         else:
-            try:date.fromisoformat(when)
-            except ValueError:flash('Date invalide.','danger')
-            else:
-                with conn() as c:
-                    cur=c.execute('INSERT INTO visits(site_id,visit_date,controleur,effected,observations,created_by,created_at) VALUES(?,?,?,?,?,?,?)',(sid,when,request.form.get('controleur','').strip() or current()['username'],int(request.form.get('effected','1')),request.form.get('observations','').strip(),current()['id'],datetime.now().isoformat(timespec='seconds')))
-                    log(c,'CREATE','visit',cur.lastrowid)
-                flash('Visite enregistrée, en attente de validation.','success');return redirect(url_for('visits'))
+            flash(f'{count} visite(s) indépendante(s) enregistrée(s).','success')
+            return redirect(url_for('visits'))
     status=request.args.get('status','');day=request.args.get('date','');site=request.args.get('site','')
     where=['1=1'];params=[]
     if current()['role']=='controleur':where.append('v.created_by=?');params.append(current()['id'])
@@ -238,6 +256,66 @@ def visits():
     if site:where.append('(s.code LIKE ? OR s.name LIKE ?)');params.extend([f'%{site}%',f'%{site}%'])
     rows=many('''SELECT v.*,s.code,s.name,u.username approver FROM visits v JOIN sites s ON s.id=v.site_id LEFT JOIN users u ON u.id=v.approved_by WHERE '''+' AND '.join(where)+' ORDER BY v.visit_date DESC,v.id DESC LIMIT 1000',params)
     return render_template('visits.html',visits=rows,sites=many("SELECT id,code,name FROM sites WHERE situation='ACTIF' ORDER BY code"),filters={'status':status,'date':day,'site':site})
+
+@app.route('/visits/declarer-plusieurs',methods=['GET','POST'])
+@role_required('admin','coordinateur','securite','dga','controleur')
+def visit_multiple():
+    if request.method=='POST':
+        try:n=create_visit_records(request.form)
+        except ValueError as e:flash(str(e),'danger')
+        else:
+            flash(f'{n} visites distinctes enregistrées.','success')
+            return redirect(url_for('visits'))
+    sites_list=many("SELECT s.id,s.code,s.name,z.name zone_name FROM sites s LEFT JOIN zones z ON z.id=s.zone_id WHERE s.situation='ACTIF' ORDER BY z.name,s.code")
+    return render_template('visit_multiple.html',sites=sites_list)
+
+@app.route('/visits/<int:vid>/edit',methods=['GET','POST'])
+@role_required('controleur')
+def visit_edit(vid):
+    v=one('SELECT v.*,s.code,s.name FROM visits v JOIN sites s ON s.id=v.site_id WHERE v.id=?',(vid,))
+    if not v:abort(404)
+    if v['created_by']!=current()['id']:abort(403)
+    if v['status']!='EN ATTENTE':abort(409,'Visite déjà traitée.')
+    if request.method=='POST':
+        sid=request.form.get('site_id','')
+        when=request.form.get('visit_date','')
+        eff=request.form.get('effected','1')
+        obs=request.form.get('observations','').strip()
+        if not sid.isdigit() or not one("SELECT id FROM sites WHERE id=? AND situation='ACTIF'",(sid,)):
+            flash('Site invalide.','danger')
+        elif eff not in ('0','1') or len(obs)>10000:
+            flash('Saisie invalide.','danger')
+        else:
+            try:date.fromisoformat(when)
+            except ValueError:flash('Date invalide.','danger')
+            else:
+                with conn() as c:
+                    result=c.execute("UPDATE visits SET site_id=?,visit_date=?,effected=?,observations=? WHERE id=? AND status='EN ATTENTE' AND created_by=?",
+                        (int(sid),when,int(eff),obs,vid,current()['id']))
+                    if result.rowcount:log(c,'UPDATE','visit',vid,'Modification avant validation')
+                if not result.rowcount:abort(409,'Visite devenue non modifiable.')
+                flash('Visite modifiée.','success')
+                return redirect(url_for('visit_detail',vid=vid))
+    sites_list=many("SELECT id,code,name FROM sites WHERE situation='ACTIF' OR id=? ORDER BY code",(v['site_id'],))
+    return render_template('visit_edit.html',v=v,sites=sites_list)
+
+@app.post('/visits/<int:vid>/delete')
+@role_required('admin','coordinateur','securite','dga')
+def visit_delete(vid):
+    if request.form.get('confirm')!='SUPPRIMER':abort(400,'Confirmation obligatoire.')
+    motif=request.form.get('motif','').strip()
+    if not motif or len(motif)>500:abort(400,'Motif obligatoire (500 caractères maximum).')
+    with conn() as c:
+        v=c.execute('SELECT * FROM visits WHERE id=?',(vid,)).fetchone()
+        if not v:abort(404)
+        if v['status']!='EN ATTENTE':abort(409,'Visite déjà traitée.')
+        messages=[dict(r) for r in c.execute('SELECT user_id,message,created_at FROM visit_messages WHERE visit_id=?',(vid,)).fetchall()]
+        snapshot={'visite':dict(v),'messages':messages,'motif':motif,'deleted_by':current()['username']}
+        result=c.execute("DELETE FROM visits WHERE id=? AND status='EN ATTENTE'",(vid,))
+        if not result.rowcount:abort(409,'Impossible de supprimer la visite.')
+        log(c,'DELETE','visit',vid,json.dumps(snapshot,ensure_ascii=False))
+    flash('Visite supprimée et opération journalisée.','success')
+    return redirect(url_for('visits'))
 
 @app.post('/visits/<int:vid>/decision')
 @role_required(*APPROVERS)

@@ -1,0 +1,17 @@
+{% extends 'base.html' %}
+{% block body %}
+<h1>Modifier une visite en attente</h1>
+<p><a href="{{url_for('visit_detail',vid=v.id)}}">← Retour au rapport</a></p>
+<section class="card">
+<p class="muted">Seules vos visites en attente peuvent être modifiées. Après validation, les informations sont verrouillées.</p>
+<form method="post">
+<input type="hidden" name="csrf" value="{{csrf_token()}}">
+<div class="formgrid">
+<div class="field"><label>Site *</label><select name="site_id" required>{% for s in sites %}<option value="{{s.id}}" {% if s.id==v.site_id %}selected{% endif %}>{{s.code}} · {{s.name}}</option>{% endfor %}</select></div>
+<div class="field"><label>Date *</label><input type="date" name="visit_date" value="{{v.visit_date}}" required></div>
+<div class="field"><label>Visite effectuée ?</label><select name="effected"><option value="1" {% if v.effected %}selected{% endif %}>Oui</option><option value="0" {% if not v.effected %}selected{% endif %}>Non</option></select></div>
+<div class="field"><label>Observations</label><textarea name="observations" rows="5" maxlength="10000">{{v.observations or ''}}</textarea></div>
+</div><div class="actions"><button class="btn">Enregistrer les modifications</button></div>
+</form>
+</section>
+{% endblock %}

@@ -1,1 +1,52 @@
-{% extends 'base.html' %}{% block body %}<h1>Rapport de visite n° {{v.id}}</h1><p><a href="{{url_for('visits')}}">← Retour aux visites</a></p><section class="card"><h2>{{v.code}} · {{v.name}}</h2><p><strong>Zone :</strong> {{v.zone_name or 'Non affectée'}} · <strong>Date :</strong> {{v.visit_date}} · <strong>Visiteur :</strong> {{v.controleur}}</p><p><strong>Statut :</strong> <span class="pill {{'valid' if v.status=='VALIDÉE' else 'reject' if v.status=='REJETÉE' else ''}}">{{v.status}}</span></p><h3>Compte rendu</h3><p style="white-space:pre-wrap">{{v.observations or 'Aucune observation'}}</p>{% if v.approved_by %}<p><strong>Décision :</strong> {{v.approver}} · {{v.approved_at}} · {{v.approval_note}}</p>{% endif %}{% if me.role in ('coordinateur','securite','dga') and v.status=='EN ATTENTE' %}<form method="post" action="{{url_for('decision',vid=v.id)}}"><input type="hidden" name="csrf" value="{{csrf_token()}}"><input name="note" placeholder="Commentaire sur la décision"><button class="btn ok" name="status" value="VALIDÉE">Valider la visite</button> <button class="btn bad" name="status" value="REJETÉE">Rejeter</button></form>{% endif %}</section><section class="card"><h2>Conversations et réponses</h2><p class="muted">Les trois responsables peuvent suivre et répondre, même après validation.</p>{% for m in messages %}<div class="message"><strong>{{m.username}} — {{roles.get(m.role,m.role)}}</strong><small> {{m.created_at}}</small><p style="white-space:pre-wrap">{{m.message}}</p></div>{% else %}<p>Aucun message pour le moment.</p>{% endfor %}{% if me.role!='lecture' %}<form method="post" action="{{url_for('visit_message',vid=v.id)}}"><input type="hidden" name="csrf" value="{{csrf_token()}}"><div class="field"><label>Écrire une réponse</label><textarea name="message" rows="4" maxlength="4000" required></textarea></div><button class="btn">Envoyer la réponse</button></form>{% endif %}</section>{% endblock %}
+{% extends 'base.html' %}
+{% block body %}
+<h1>Rapport de visite n° {{v.id}}</h1>
+<p><a href="{{url_for('visits')}}">← Retour aux visites</a></p>
+<section class="card">
+  <h2>{{v.code}} · {{v.name}}</h2>
+  <p><strong>Zone :</strong> {{v.zone_name or 'Non affectée'}} · <strong>Date :</strong> {{v.visit_date}} · <strong>Visiteur :</strong> {{v.controleur}}</p>
+  <p><strong>Statut :</strong> <span class="pill {{'valid' if v.status=='VALIDÉE' else 'reject' if v.status=='REJETÉE' else ''}}">{{v.status}}</span></p>
+  <h3>Compte rendu</h3><p style="white-space:pre-wrap">{{v.observations or 'Aucune observation'}}</p>
+  {% if v.approved_by %}<p><strong>Décision :</strong> {{v.approver}} · {{v.approved_at}} · {{v.approval_note}}</p>{% endif %}
+  {% if me.role=='controleur' and v.created_by==me.id and v.status=='EN ATTENTE' %}
+  <p><a class="btn" href="{{url_for('visit_edit',vid=v.id)}}">Modifier cette visite en attente</a></p>
+  {% endif %}
+  {% if me.role in ('coordinateur','securite','dga') and v.status=='EN ATTENTE' %}
+  <form method="post" action="{{url_for('decision',vid=v.id)}}">
+    <input type="hidden" name="csrf" value="{{csrf_token()}}">
+    <input name="note" placeholder="Commentaire sur la décision">
+    <button class="btn ok" name="status" value="VALIDÉE">Valider la visite</button>
+    <button class="btn bad" name="status" value="REJETÉE">Rejeter</button>
+  </form>
+  {% endif %}
+</section>
+<section class="card">
+  <h2>Conversations et réponses</h2>
+  <p class="muted">Les trois responsables peuvent suivre et répondre, même après validation.</p>
+  {% for m in messages %}
+    <div class="message"><strong>{{m.username}} — {{roles.get(m.role,m.role)}}</strong>
+      <small> {{m.created_at}}</small><p style="white-space:pre-wrap">{{m.message}}</p></div>
+  {% else %}<p>Aucun message pour le moment.</p>{% endfor %}
+  {% if me.role!='lecture' %}
+    <form method="post" action="{{url_for('visit_message',vid=v.id)}}">
+      <input type="hidden" name="csrf" value="{{csrf_token()}}">
+      <div class="field"><label>Écrire une réponse</label><textarea name="message" rows="4" maxlength="4000" required></textarea></div>
+      <button class="btn">Envoyer la réponse</button>
+    </form>
+  {% endif %}
+</section>
+{% if me.role in ('admin','coordinateur','securite','dga') and v.status=='EN ATTENTE' %}
+<section class="card" id="supprimer-visite">
+  <h2>Supprimer cette visite en attente</h2>
+  <p class="muted">Cette action est réservée aux responsables autorisés. La visite et ses échanges seront retirés du registre. Un historique sera conservé dans le journal d'audit.</p>
+  <form method="post" action="{{url_for('visit_delete',vid=v.id)}}" onsubmit="return confirm('Confirmer la suppression définitive de la visite n° {{v.id}} ?')">
+    <input type="hidden" name="csrf" value="{{csrf_token()}}">
+    <div class="field"><label>Motif de suppression *</label><textarea name="motif" maxlength="500" required rows="2"></textarea></div>
+    <div class="field"><label>Pour confirmer, choisissez SUPPRIMER *</label>
+      <select name="confirm" required><option value="">Choisir</option><option value="SUPPRIMER">SUPPRIMER</option></select>
+    </div>
+    <button class="btn bad" type="submit">Supprimer la visite en attente</button>
+  </form>
+</section>
+{% endif %}
+{% endblock %}

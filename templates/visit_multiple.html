@@ -1,0 +1,25 @@
+{% extends 'base.html' %}
+{% block body %}
+<h1>Déclarer plusieurs visites</h1>
+<p><a href="{{url_for('visits')}}">← Retour aux visites</a></p>
+<section class="card">
+<p class="muted">Cochez plusieurs sites : une visite distincte sera créée pour chacun d'eux.</p>
+<form method="post"><input type="hidden" name="csrf" value="{{csrf_token()}}">
+<div class="field"><label>Rechercher un site</label><input id="search-sites" type="search" placeholder="Code, nom, zone"></div>
+<div class="field"><label>Sites sélectionnés : <strong id="selected-count">0</strong> (maximum 100)</label>
+<div style="max-height:300px;overflow:auto;border:1px solid #ddd;border-radius:8px;padding:10px">
+{% for s in sites %}<label class="site-item" data-search="{{(s.code ~ ' ' ~ s.name ~ ' ' ~ (s.zone_name or ''))|lower}}" style="display:block;padding:6px"><input name="site_ids" type="checkbox" value="{{s.id}}"> {{s.code}} · {{s.name}} {% if s.zone_name %}({{s.zone_name}}){% endif %}</label>{% endfor %}
+</div></div>
+<div class="formgrid"><div class="field"><label>Date</label><input type="date" required name="visit_date" value="{{today}}"></div>
+<div class="field"><label>Contrôleur</label><input name="controleur" value="{{me.username}}"></div>
+<div class="field"><label>Visite effectuée ?</label><select name="effected"><option value="1">Oui</option><option value="0">Non</option></select></div>
+<div class="field"><label>Observations communes</label><textarea name="observations" maxlength="10000" rows="3"></textarea></div></div>
+<button id="declare-btn" class="btn" disabled>Déclarer les visites</button>
+</form></section>
+<script>
+const checks=[...document.querySelectorAll('input[name="site_ids"]')];
+function updateCount(){const n=checks.filter(e=>e.checked).length;document.getElementById('selected-count').textContent=n;const b=document.getElementById('declare-btn');b.disabled=n===0||n>100;b.textContent='Déclarer '+n+' visite(s) distincte(s)';}
+checks.forEach(e=>e.addEventListener('change',updateCount));
+document.getElementById('search-sites').addEventListener('input',e=>{const q=e.target.value.toLowerCase();document.querySelectorAll('.site-item').forEach(el=>{el.style.display=el.dataset.search.includes(q)?'block':'none';});});
+</script>
+{% endblock %}

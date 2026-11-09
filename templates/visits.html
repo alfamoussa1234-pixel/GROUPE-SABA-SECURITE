@@ -1,1 +1,100 @@
-{% extends 'base.html' %}{% block body %}<h1>Visites et validations</h1><p class="muted">Une visite n’est comptabilisée comme validée qu’après l’approbation d’au moins un responsable habilité.</p>{% if me.role!='lecture' %}<section class="card"><h2>Déclarer une visite</h2><form method="post"><input type="hidden" name="csrf" value="{{csrf_token()}}"><div class="formgrid"><div class="field"><label>Site *</label><select name="site_id" required><option value="">Choisir un site</option>{% for s in sites %}<option value="{{s.id}}">{{s.code}} · {{s.name}}</option>{% endfor %}</select></div><div class="field"><label>Date *</label><input type="date" name="visit_date" value="{{today}}" required></div><div class="field"><label>Agent / contrôleur</label><input name="controleur" value="{{me.username}}"></div><div class="field"><label>Visite effectuée ?</label><select name="effected"><option value="1">Oui</option><option value="0">Non</option></select></div><div class="field"><label>Compte rendu détaillé</label><textarea name="observations" rows="3" placeholder="Présence, état du poste, anomalies, actions recommandées..."></textarea></div></div><div class="actions"><button class="btn">Enregistrer la visite</button></div></form></section>{% endif %}<section class="card"><div class="headrow"><h2>Registre des visites</h2><form method="get" class="actions"><input name="site" value="{{filters.site}}" placeholder="Code ou site"><input name="date" value="{{filters.date}}" type="date"><select name="status"><option value="">Tous les statuts</option>{% for x in ['EN ATTENTE','VALIDÉE','REJETÉE'] %}<option value="{{x}}" {% if filters.status==x %}selected{% endif %}>{{x}}</option>{% endfor %}</select><button class="btn small">Filtrer</button></form></div><div class="tablewrap"><table><tr><th>Date</th><th>Site</th><th>Contrôleur</th><th>Effectuée</th><th>Observations</th><th>Statut</th><th>Validateur</th><th>Rapport / échanges</th></tr>{% for v in visits %}<tr><td>{{v.visit_date}}</td><td><a href="{{url_for('visit_detail',vid=v.id)}}">{{v.code}} · {{v.name}}</a></td><td>{{v.controleur}}</td><td>{{'Oui' if v.effected else 'Non'}}</td><td class="wrap">{{v.observations}}</td><td><span class="pill {{'valid' if v.status=='VALIDÉE' else 'reject' if v.status=='REJETÉE' else ''}}">{{v.status}}</span></td><td>{{v.approver or '—'}}</td><td>{% if me.role in ('coordinateur','securite','dga') and v.status=='EN ATTENTE' %}<form method="post" action="{{url_for('decision',vid=v.id)}}"><input type="hidden" name="csrf" value="{{csrf_token()}}"><input name="note" placeholder="Motif (facultatif)" style="min-width:145px;margin-bottom:4px"><button class="btn small ok" name="status" value="VALIDÉE">Valider</button> <button class="btn small bad" name="status" value="REJETÉE">Rejeter</button></form>{% else %}<a href="{{url_for('visit_detail',vid=v.id)}}">Ouvrir les échanges</a>{% endif %}</td></tr>{% else %}<tr><td colspan="8">Aucune visite.</td></tr>{% endfor %}</table></div></section>{% endblock %}
+{% extends 'base.html' %}
+{% block body %}
+<h1>Visites et validations</h1>
+<p class="muted">Chaque site déclaré possède une visite distincte. Une seule validation d'un responsable habilité suffit.</p>
+{% if me.role!='lecture' %}
+<section class="card">
+  <h2>Déclarer une ou plusieurs visites</h2>
+  <p class="muted">Cochez les sites concernés. Une visite indépendante sera créée pour chaque site coché.</p>
+  <form method="post" action="{{url_for('visits')}}">
+    <input type="hidden" name="csrf" value="{{csrf_token()}}">
+    <div class="field">
+      <label for="site-search">Rechercher un site à cocher</label>
+      <input type="search" id="site-search" placeholder="Code ou nom du site" oninput="filterVisitSites(this.value)">
+    </div>
+    <div class="field">
+      <label>Sites à déclarer * — <strong id="site-count">0 sélectionné</strong> (100 maximum)</label>
+      <div style="max-height:260px;overflow:auto;border:1px solid #ddd;border-radius:8px;padding:10px">
+        {% for s in sites %}
+        <label class="visit-site-line" data-search="{{(s.code ~ ' ' ~ s.name)|lower}}" style="display:block;padding:6px 4px">
+          <input type="checkbox" name="site_ids" value="{{s.id}}" onchange="refreshVisitCount()">
+          {{s.code}} · {{s.name}}
+        </label>
+        {% else %}<p>Aucun site actif disponible.</p>{% endfor %}
+      </div>
+    </div>
+    <div class="formgrid">
+      <div class="field"><label>Date *</label><input type="date" name="visit_date" value="{{today}}" required></div>
+      <div class="field"><label>Agent / contrôleur</label><input name="controleur" value="{{me.username}}"></div>
+      <div class="field"><label>Visite effectuée ?</label><select name="effected"><option value="1">Oui</option><option value="0">Non</option></select></div>
+      <div class="field"><label>Compte rendu détaillé (commun aux sites sélectionnés)</label>
+        <textarea name="observations" maxlength="10000" rows="3" placeholder="Présence, état du poste, anomalies, actions recommandées..."></textarea>
+      </div>
+    </div>
+    <div class="actions"><button class="btn" id="visit-submit" type="submit" disabled>Déclarer les visites</button></div>
+  </form>
+</section>
+{% endif %}
+<section class="card">
+  <div class="headrow">
+    <h2>Registre des visites</h2>
+    <form method="get" class="actions">
+      <input name="site" value="{{filters.site}}" placeholder="Code ou site">
+      <input name="date" value="{{filters.date}}" type="date">
+      <select name="status">
+        <option value="">Tous les statuts</option>
+        {% for x in ['EN ATTENTE','VALIDÉE','REJETÉE'] %}
+        <option value="{{x}}" {% if filters.status==x %}selected{% endif %}>{{x}}</option>
+        {% endfor %}
+      </select>
+      <button class="btn small">Filtrer</button>
+    </form>
+  </div>
+  <div class="tablewrap"><table>
+    <tr><th>Date</th><th>Site</th><th>Contrôleur</th><th>Effectuée</th><th>Observations</th><th>Statut</th><th>Validateur</th><th>Actions</th></tr>
+    {% for v in visits %}
+    <tr>
+      <td>{{v.visit_date}}</td>
+      <td><a href="{{url_for('visit_detail',vid=v.id)}}">{{v.code}} · {{v.name}}</a></td>
+      <td>{{v.controleur}}</td>
+      <td>{{'Oui' if v.effected else 'Non'}}</td>
+      <td class="wrap">{{v.observations}}</td>
+      <td><span class="pill {{'valid' if v.status=='VALIDÉE' else 'reject' if v.status=='REJETÉE' else ''}}">{{v.status}}</span></td>
+      <td>{{v.approver or '—'}}</td>
+      <td>
+        <a href="{{url_for('visit_detail',vid=v.id)}}">Rapport / échanges</a>
+        {% if me.role=='controleur' and v.created_by==me.id and v.status=='EN ATTENTE' %}
+          <p><a class="btn small" href="{{url_for('visit_edit',vid=v.id)}}">Modifier</a></p>
+        {% endif %}
+        {% if me.role in ('coordinateur','securite','dga') and v.status=='EN ATTENTE' %}
+          <form method="post" action="{{url_for('decision',vid=v.id)}}" style="margin-top:8px">
+            <input type="hidden" name="csrf" value="{{csrf_token()}}">
+            <input name="note" placeholder="Motif (facultatif)" style="min-width:145px;margin-bottom:4px">
+            <button class="btn small ok" name="status" value="VALIDÉE">Valider</button>
+            <button class="btn small bad" name="status" value="REJETÉE">Rejeter</button>
+          </form>
+        {% endif %}
+        {% if me.role in ('admin','coordinateur','securite','dga') and v.status=='EN ATTENTE' %}
+          <p><a href="{{url_for('visit_detail',vid=v.id)}}#supprimer-visite">Supprimer…</a></p>
+        {% endif %}
+      </td>
+    </tr>
+    {% else %}<tr><td colspan="8">Aucune visite.</td></tr>{% endfor %}
+  </table></div>
+</section>
+<script>
+function filterVisitSites(query) {
+  document.querySelectorAll('.visit-site-line').forEach(function(el) {
+    el.style.display = el.dataset.search.includes(query.toLowerCase()) ? 'block' : 'none';
+  });
+}
+function refreshVisitCount() {
+  const count=document.querySelectorAll('input[name="site_ids"]:checked').length;
+  const label=document.getElementById('site-count');
+  const submit=document.getElementById('visit-submit');
+  if(label) label.textContent=count+' sélectionné(s)';
+  if(submit) {submit.disabled=count<1||count>100;submit.textContent='Déclarer '+count+' visite(s) distincte(s)';}
+}
+refreshVisitCount();
+</script>
+{% endblock %}

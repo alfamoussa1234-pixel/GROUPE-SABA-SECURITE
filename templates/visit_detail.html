@@ -8,6 +8,17 @@
   <p><strong>Statut :</strong> <span class="pill {{'valid' if v.status=='VALIDÉE' else 'reject' if v.status=='REJETÉE' else ''}}">{{v.status}}</span></p>
   <h3>Compte rendu</h3><p style="white-space:pre-wrap">{{v.observations or 'Aucune observation'}}</p>
   {% if v.approved_by %}<p><strong>Décision :</strong> {{v.approver}} · {{v.approved_at}} · {{v.approval_note}}</p>{% endif %}
+  {% if me.role in ('coordinateur','securite','dga') and v.status=='VALIDÉE' %}
+  <div class="undo-box" id="annuler-validation">
+    <h3>Revenir sur la validation</h3>
+    <p class="muted">La visite repassera EN ATTENTE. Le rapport et les conversations seront conservés.</p>
+    <form method="post" action="{{url_for('undo_validation',vid=v.id)}}" onsubmit="return confirm('Annuler cette validation et remettre la visite EN ATTENTE ?')">
+      <input type="hidden" name="csrf" value="{{csrf_token()}}">
+      <div class="field"><label>Motif de l’annulation *</label><textarea name="motif" maxlength="500" rows="2" required placeholder="Précisez pourquoi la validation doit être annulée"></textarea></div>
+      <div class="actions"><button type="submit" class="btn bad">↶ Annuler la validation</button></div>
+    </form>
+  </div>
+  {% endif %}
   {% if me.role=='controleur' and v.created_by==me.id and v.status=='EN ATTENTE' %}
   <p><a class="btn" href="{{url_for('visit_edit',vid=v.id)}}">Modifier cette visite en attente</a></p>
   {% endif %}
@@ -20,6 +31,20 @@
   </form>
   {% endif %}
 </section>
+{% if history %}
+<section class="card">
+  <h2>Historique des décisions</h2>
+  {% for a in history %}
+    <div class="audit-item">
+      <strong>{% if a.action=='ANNULATION_VALIDATION' %}↶ Validation annulée{% elif a.action=='VALIDÉE' %}✓ Visite validée{% else %}Visite rejetée{% endif %}</strong>
+      <span class="muted"> · {{a.username or 'Utilisateur'}} · {{a.created_at}}</span>
+      {% if a.action=='ANNULATION_VALIDATION' %}
+        <p><strong>Motif :</strong> {{a.reason or 'Motif non disponible'}}</p>
+      {% elif a.details %}<p><strong>Commentaire :</strong> {{a.details}}</p>{% endif %}
+    </div>
+  {% endfor %}
+</section>
+{% endif %}
 <section class="card">
   <h2>Conversations et réponses</h2>
   <p class="muted">Les trois responsables peuvent suivre et répondre, même après validation.</p>

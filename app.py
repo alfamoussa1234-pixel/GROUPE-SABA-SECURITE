@@ -1,7 +1,7 @@
 import os, sqlite3, secrets, csv, io, json
 from datetime import datetime, date
 from functools import wraps
-from flask import Flask, request, session, redirect, url_for, flash, render_template, Response, abort
+from flask import Flask, request, session, redirect, url_for, flash, render_template, Response, abort, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 
@@ -34,6 +34,20 @@ def init_db():
         CREATE INDEX IF NOT EXISTS visits_date_idx ON visits(visit_date);
         CREATE INDEX IF NOT EXISTS visits_site_idx ON visits(site_id);
         CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, user_id INTEGER, action TEXT, entity TEXT, entity_id INTEGER, created_at TEXT, details TEXT);
+        CREATE TABLE IF NOT EXISTS notifications(
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            actor_id INTEGER REFERENCES users(id),
+            visit_id INTEGER NOT NULL REFERENCES visits(id) ON DELETE CASCADE,
+            event_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            message TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            read_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS notifications_user_unread_idx ON notifications(user_id,read_at,id);
+        CREATE INDEX IF NOT EXISTS notifications_visit_idx ON notifications(visit_id);
+
         ''')
         existing={r['name'] for r in c.execute('PRAGMA table_info(sites)')}
         if 'zone_id' not in existing:c.execute('ALTER TABLE sites ADD COLUMN zone_id INTEGER REFERENCES zones(id)')
@@ -47,6 +61,31 @@ def selected_zone(value):
 
 def log(c,action,entity,entity_id,details=''):
     c.execute('INSERT INTO audit(user_id,action,entity,entity_id,created_at,details) VALUES(?,?,?,?,?,?)', (session.get('uid'),action,entity,entity_id,datetime.now().isoformat(timespec='seconds'),details))
+
+def notify(c, visit_id, event_type, title, message, creator_id=None, include_responsables=True):
+    """Enregistre des notifications pour les utilisateurs actifs concernés.
+    La fonction est appelée dans la même transaction que l'événement d'origine.
+    """
+    actor_id=session.get('uid')
+    recipients=set()
+    if creator_id is not None:
+        recipients.add(creator_id)
+    if include_responsables:
+        recipients.update(r['id'] for r in c.execute(
+            "SELECT id FROM users WHERE active=1 AND role IN ('admin','coordinateur','securite','dga')"))
+    if actor_id is not None:
+        recipients.discard(actor_id)
+    now=datetime.now().isoformat(timespec='seconds')
+    for recipient_id in recipients:
+        # Ne pas notifier les anciens utilisateurs inactifs.
+        active=c.execute('SELECT 1 FROM users WHERE id=? AND active=1',(recipient_id,)).fetchone()
+        if active:
+            c.execute('''INSERT INTO notifications(user_id,actor_id,visit_id,event_type,title,message,created_at)
+                         VALUES(?,?,?,?,?,?,?)''',
+                      (recipient_id,actor_id,visit_id,event_type,title,message,now))
+
+def unread_notifications(uid):
+    return one('SELECT COUNT(*) AS n FROM notifications WHERE user_id=? AND read_at IS NULL',(uid,))['n']
 
 def one(query,args=()):
     with conn() as c:return c.execute(query,args).fetchone()
@@ -84,7 +123,47 @@ def check_csrf():
     if request.method=='POST' and not secrets.compare_digest(request.form.get('csrf',''),token()):abort(400,'Jeton de sécurité invalide. Actualisez la page.')
 
 @app.context_processor
-def context():return {'me':current(),'csrf_token':token,'roles':ROLES,'today':date.today().isoformat()}
+def context():
+    me=current()
+    return {'me':me,'csrf_token':token,'roles':ROLES,'today':date.today().isoformat(),
+            'unread_count': unread_notifications(me['id']) if me else 0}
+
+@app.route('/notifications')
+@login_required
+def notifications_page():
+    rows=many('''SELECT n.*,u.username actor_name,s.code,s.name site_name
+                 FROM notifications n
+                 LEFT JOIN users u ON u.id=n.actor_id
+                 JOIN visits v ON v.id=n.visit_id
+                 JOIN sites s ON s.id=v.site_id
+                 WHERE n.user_id=? ORDER BY n.id DESC LIMIT 100''',(current()['id'],))
+    return render_template('notifications.html',notifications=rows)
+
+@app.route('/notifications/count')
+@login_required
+def notifications_count():
+    response=jsonify({'unread':unread_notifications(current()['id'])})
+    response.headers['Cache-Control']='no-store'
+    return response
+
+@app.post('/notifications/<int:nid>/read')
+@login_required
+def notification_read(nid):
+    with conn() as c:
+        row=c.execute('SELECT visit_id FROM notifications WHERE id=? AND user_id=?',(nid,current()['id'])).fetchone()
+        if not row:abort(404)
+        c.execute('UPDATE notifications SET read_at=COALESCE(read_at,?) WHERE id=? AND user_id=?',
+                  (datetime.now().isoformat(timespec='seconds'),nid,current()['id']))
+    return redirect(url_for('visit_detail',vid=row['visit_id']))
+
+@app.post('/notifications/read-all')
+@login_required
+def notifications_read_all():
+    with conn() as c:
+        c.execute('UPDATE notifications SET read_at=? WHERE user_id=? AND read_at IS NULL',
+                  (datetime.now().isoformat(timespec='seconds'),current()['id']))
+    flash('Toutes les notifications ont été marquées comme lues.','success')
+    return redirect(url_for('notifications_page'))
 
 @app.route('/setup',methods=['GET','POST'])
 def setup():
@@ -165,7 +244,20 @@ def visit_detail(vid):
     if not v:abort(404)
     if current()['role']=='controleur' and v['created_by']!=current()['id']:abort(403)
     messages=many('''SELECT m.*,u.username,u.role FROM visit_messages m JOIN users u ON u.id=m.user_id WHERE m.visit_id=? ORDER BY m.id''',(vid,))
-    return render_template('visit_detail.html',v=v,messages=messages)
+    history=many('''SELECT a.action,a.created_at,a.details,u.username
+                    FROM audit a LEFT JOIN users u ON u.id=a.user_id
+                    WHERE a.entity='visit' AND a.entity_id=?
+                    AND a.action IN ('VALIDÉE','REJETÉE','ANNULATION_VALIDATION')
+                    ORDER BY a.id DESC''',(vid,))
+    history_items=[]
+    for item in history:
+        row=dict(item)
+        row['reason']=''
+        if row['action']=='ANNULATION_VALIDATION':
+            try:row['reason']=json.loads(row['details']).get('motif','')
+            except (TypeError,ValueError,AttributeError):row['reason']='Motif conservé dans le journal'
+        history_items.append(row)
+    return render_template('visit_detail.html',v=v,messages=messages,history=history_items)
 
 @app.post('/visits/<int:vid>/messages')
 @login_required
@@ -179,6 +271,10 @@ def visit_message(vid):
         with conn() as c:
             cur=c.execute('INSERT INTO visit_messages(visit_id,user_id,message,created_at) VALUES(?,?,?,?)',(vid,current()['id'],message,datetime.now().isoformat(timespec='seconds')))
             log(c,'MESSAGE','visit',vid,str(cur.lastrowid))
+            site=c.execute('''SELECT s.code,s.name FROM visits v JOIN sites s ON s.id=v.site_id WHERE v.id=?''',(vid,)).fetchone()
+            notify(c,vid,'MESSAGE','Nouvelle réponse sur une visite',
+                   f"{current()['username']} a répondu au rapport du site {site['code']} · {site['name']}.",
+                   creator_id=v['created_by'])
         flash('Réponse enregistrée.','success')
     return redirect(url_for('visit_detail',vid=vid))
 
@@ -235,6 +331,9 @@ def create_visit_records(form):
             cur=c.execute('INSERT INTO visits(site_id,visit_date,controleur,effected,observations,created_by,created_at) VALUES(?,?,?,?,?,?,?)',
                 (sid,form['visit_date'],ctl,int(effected),obs,current()['id'],datetime.now().isoformat(timespec='seconds')))
             log(c,'CREATE','visit',cur.lastrowid,'Déclaration multiple' if len(ids)>1 else '')
+            site=c.execute('SELECT code,name FROM sites WHERE id=?',(sid,)).fetchone()
+            notify(c,cur.lastrowid,'NEW_VISIT','Nouveau rapport de visite',
+                   f"{current()['username']} a déclaré une visite pour {site['code']} · {site['name']}.")
     return len(ids)
 
 @app.route('/visits',methods=['GET','POST'])
@@ -328,9 +427,41 @@ def decision(vid):
         if r['status']!='EN ATTENTE':flash('Cette visite a déjà reçu une décision.','danger')
         elif not r['effected'] and status=='VALIDÉE':flash('Une visite non effectuée ne peut pas être validée.','danger')
         else:
-            c.execute('UPDATE visits SET status=?,approved_by=?,approved_at=?,approval_note=? WHERE id=?',(status,current()['id'],datetime.now().isoformat(timespec='seconds'),request.form.get('note','').strip(),vid))
-            log(c,status,'visit',vid)
+            note=request.form.get('note','').strip()[:1000]
+            updated=c.execute("UPDATE visits SET status=?,approved_by=?,approved_at=?,approval_note=? WHERE id=? AND status='EN ATTENTE'",
+                (status,current()['id'],datetime.now().isoformat(timespec='seconds'),note,vid))
+            if not updated.rowcount:abort(409,"Cette visite vient d'être traitée.")
+            log(c,status,'visit',vid,note)
+            site=c.execute('''SELECT s.code,s.name FROM visits v JOIN sites s ON s.id=v.site_id WHERE v.id=?''',(vid,)).fetchone()
+            notify(c,vid,'DECISION','Visite '+status.lower(),
+                   f"{current()['username']} a marqué {site['code']} · {site['name']} comme {status.lower()}.",
+                   creator_id=r['created_by'])
             flash('Décision enregistrée.','success')
+    return redirect(url_for('visit_detail',vid=vid))
+
+@app.post('/visits/<int:vid>/undo-validation')
+@role_required(*APPROVERS)
+def undo_validation(vid):
+    motif=request.form.get('motif','').strip()
+    if not motif or len(motif)>500:
+        flash('Le motif d’annulation est obligatoire (500 caractères maximum).','danger')
+        return redirect(url_for('visit_detail',vid=vid))
+    with conn() as c:
+        visit=c.execute('SELECT * FROM visits WHERE id=?',(vid,)).fetchone()
+        if not visit:abort(404)
+        if visit['status']!='VALIDÉE':
+            flash('Seules les visites validées peuvent être remises en attente.','danger')
+            return redirect(url_for('visit_detail',vid=vid))
+        previous={key:visit[key] for key in ('status','approved_by','approved_at','approval_note')}
+        changed=c.execute("UPDATE visits SET status='EN ATTENTE',approved_by=NULL,approved_at=NULL,approval_note='' WHERE id=? AND status='VALIDÉE'",(vid,))
+        if not changed.rowcount:abort(409,'Cette validation a déjà été annulée.')
+        log(c,'ANNULATION_VALIDATION','visit',vid,
+            json.dumps({'motif':motif,'previous':previous},ensure_ascii=False))
+        site=c.execute('''SELECT s.code,s.name FROM visits v JOIN sites s ON s.id=v.site_id WHERE v.id=?''',(vid,)).fetchone()
+        notify(c,vid,'UNDO_VALIDATION','Validation annulée',
+               f"{current()['username']} a annulé la validation du site {site['code']} · {site['name']}. Motif : {motif}",
+               creator_id=visit['created_by'])
+    flash('Validation annulée : la visite est de nouveau EN ATTENTE.','success')
     return redirect(url_for('visit_detail',vid=vid))
 
 @app.route('/reports')

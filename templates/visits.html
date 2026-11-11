@@ -74,6 +74,9 @@
             <button class="btn small bad" name="status" value="REJETÉE">Rejeter</button>
           </form>
         {% endif %}
+        {% if me.role in ('coordinateur','securite','dga') and v.status=='VALIDÉE' %}
+          <p><a class="btn small secondary" href="{{url_for('visit_detail',vid=v.id)}}#annuler-validation">↶ Annuler la validation</a></p>
+        {% endif %}
         {% if me.role in ('admin','coordinateur','securite','dga') and v.status=='EN ATTENTE' %}
           <p><a href="{{url_for('visit_detail',vid=v.id)}}#supprimer-visite">Supprimer…</a></p>
         {% endif %}

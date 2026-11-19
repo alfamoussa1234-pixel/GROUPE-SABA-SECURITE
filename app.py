@@ -1,7 +1,7 @@
 import os, sqlite3, secrets, csv, io, json
 from datetime import datetime, date
 from functools import wraps
-from flask import Flask, request, session, redirect, url_for, flash, render_template, Response, abort, jsonify
+from flask import Flask, request, session, redirect, url_for, flash, render_template, render_template_string, Response, abort, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 
@@ -13,6 +13,72 @@ app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', S
 DB = os.environ.get('DATABASE_PATH', os.path.join(os.path.dirname(__file__), 'saba.sqlite3'))
 ROLES = {'admin':'Administrateur', 'coordinateur':'Coordinateur général', 'securite':'Responsable sécurité', 'dga':'DGA', 'controleur':'Contrôleur', 'lecture':'Consultation'}
 APPROVERS = ('coordinateur','securite','dga')
+
+# Version autonome de la page Sites : evite qu'un ancien fichier templates/sites.html
+# sur le serveur masque la nouvelle interface de gestion des effectifs.
+SITES_INLINE_TEMPLATE = r'''{% extends 'base.html' %}
+{% block body %}
+<div class="headrow">
+  <div><h1>Sites et effectifs</h1><p class="muted">Effectifs gérés par l’administrateur, le coordinateur général, le responsable sécurité et le DGA. Les sites supprimés sont conservés dans les archives.</p></div>
+  {% if me.role=='admin' %}<a class="btn secondary" href="{{url_for('sites',archived='0' if archived else '1')}}">{{'Voir les sites actifs' if archived else 'Voir les sites supprimés'}}</a>{% endif %}
+</div>
+{% if me.role in ('admin','coordinateur','securite') and not archived %}
+<section class="card"><h2>Ajouter un site</h2>
+<form method="post"><input type="hidden" name="csrf" value="{{csrf_token()}}">
+<div class="formgrid">
+  <div class="field"><label>Code site *</label><input name="code" placeholder="S001" required maxlength="80"></div>
+  <div class="field"><label>Nom du site *</label><input name="name" required maxlength="200"></div>
+  <div class="field"><label>Zone affectée</label><select name="zone_id"><option value="">Sans zone</option>{% for z in zones %}<option value="{{z.id}}">{{z.name}}</option>{% endfor %}</select></div>
+  <div class="field"><label>Quartier / localisation</label><input name="quartier"></div>
+  <div class="field"><label>Responsable</label><input name="responsable"></div>
+  <div class="field"><label>Client / contrat</label><input name="client"></div>
+  <div class="field"><label>Situation</label><select name="situation"><option>ACTIF</option><option>INACTIF</option></select></div>
+  <div class="field"><label>Observations</label><input name="observations"></div>
+</div><div class="actions"><button class="btn">Enregistrer le site</button></div></form></section>
+{% endif %}
+<section class="card">
+<div class="headrow"><h2>{{'Sites supprimés' if archived else 'Répertoire des sites'}} ({{sites|length}} affichés)</h2>
+  <form method="get" class="actions"><input type="hidden" name="archived" value="{{'1' if archived else '0'}}"><input name="q" value="{{q}}" placeholder="Rechercher code ou nom"><button class="btn small">Rechercher</button></form>
+</div>
+{% if not archived %}<p class="hint">Le nombre d'agents correspond à l'effectif affecté au site. « Non renseigné » signifie que l’effectif n’a pas encore été saisi par une personne habilitée.</p>{% endif %}
+<div class="tablewrap"><table>
+<thead><tr><th>Code</th><th>Site</th><th>Zone</th><th>Quartier</th><th>Client</th><th>Situation</th><th>Agents affectés</th><th>Dernière saisie</th><th>Actions</th></tr></thead>
+<tbody>{% for s in sites %}<tr>
+<td><strong>{{s.code}}</strong></td><td>{{s.name}}</td><td>{{s.zone_name or 'Non affecté'}}</td><td>{{s.quartier}}</td><td>{{s.client}}</td><td>{{s.situation}}</td>
+<td>
+  {% if not archived and me.role in ('admin','coordinateur','securite','dga') %}
+    <form method="post" action="{{url_for('update_site_agents',sid=s.id)}}" class="agent-form">
+    <input type="hidden" name="csrf" value="{{csrf_token()}}">
+    <input aria-label="Nombre d'agents affectés à {{s.code}}" type="number" name="agent_count" min="0" max="10000" step="1" value="{{s.agent_count if s.agent_count is not none else ''}}" placeholder="Nombre" required>
+    <button class="btn small" title="Enregistrer l'effectif">Enregistrer</button></form>
+  {% else %}<strong>{{s.agent_count if s.agent_count is not none else 'Non renseigné'}}</strong>{% endif %}
+</td>
+<td>{% if s.agent_count_updated_at %}{{s.agents_updated_by or 'Utilisateur'}}<br><small class="muted">{{s.agent_count_updated_at[:16].replace('T',' ')}}</small>{% else %}—{% endif %}</td>
+<td class="site-actions">
+  {% if archived %}
+    {% if me.role=='admin' %}
+    <form method="post" action="{{url_for('site_restore',sid=s.id)}}"><input type="hidden" name="csrf" value="{{csrf_token()}}"><button class="btn small ok">Restaurer</button></form>
+    {% if s.visits_count==0 %}
+    <form method="post" action="{{url_for('site_delete_permanently',sid=s.id)}}" onsubmit="return confirm('Effacer définitivement ce site sans rapport ? Cette action ne peut pas être annulée.')"><input type="hidden" name="csrf" value="{{csrf_token()}}"><input type="hidden" name="confirm" value="EFFACER"><button class="btn small bad">Effacer définitivement</button></form>
+    {% endif %}
+    {% endif %}
+  {% else %}
+    {% if me.role in ('admin','coordinateur','securite') %}<a class="btn small secondary" href="{{url_for('site_edit',sid=s.id)}}">Modifier</a>{% endif %}
+    {% if me.role=='admin' %}
+      <details><summary class="danger-text">Supprimer</summary>
+      <form method="post" action="{{url_for('site_archive',sid=s.id)}}" class="delete-form">
+        <input type="hidden" name="csrf" value="{{csrf_token()}}"><input type="hidden" name="confirm" value="SUPPRIMER">
+        <label>Motif de suppression</label><input name="motif" maxlength="500" required placeholder="Motif obligatoire">
+        <p class="hint">Le site disparaîtra du répertoire, mais ses visites seront conservées.</p>
+        <button class="btn small bad" onclick="return confirm('Supprimer ce site du répertoire actif ?')">Confirmer</button>
+      </form></details>
+    {% endif %}
+  {% endif %}
+</td>
+</tr>{% else %}<tr><td colspan="9">Aucun site trouvé.</td></tr>{% endfor %}</tbody>
+</table></div></section>
+{% endblock %}
+'''
 
 def conn():
     c=sqlite3.connect(DB, timeout=20)
@@ -325,7 +391,7 @@ def sites():
                  LEFT JOIN users u ON u.id=s.agent_count_updated_by
                  WHERE (s.code LIKE ? OR s.name LIKE ?) AND s.archived_at IS '''+('NOT NULL' if archived else 'NULL')+
                ' ORDER BY s.code LIMIT 1000',(f'%{q}%',f'%{q}%'))
-    return render_template('sites.html',sites=rows,q=q,zones=all_zones(),archived=archived)
+    return render_template_string(SITES_INLINE_TEMPLATE,sites=rows,q=q,zones=all_zones(),archived=archived)
 
 @app.route('/sites/<int:sid>/edit',methods=['GET','POST'])
 @role_required('admin','coordinateur','securite')

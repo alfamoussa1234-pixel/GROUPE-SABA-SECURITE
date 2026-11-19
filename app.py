@@ -1,4 +1,7 @@
-import os, sqlite3, secrets, csv, io, json
+import os, sqlite3, secrets, csv, io, json, re, unicodedata, zipfile
+from xml.etree import ElementTree as ET
+from xml.sax.saxutils import escape as xml_escape
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, date
 from functools import wraps
 from flask import Flask, request, session, redirect, url_for, flash, render_template, render_template_string, Response, abort, jsonify
@@ -20,7 +23,11 @@ SITES_INLINE_TEMPLATE = r'''{% extends 'base.html' %}
 {% block body %}
 <div class="headrow">
   <div><h1>Sites et effectifs</h1><p class="muted">Effectifs gérés par l’administrateur, le coordinateur général, le responsable sécurité et le DGA. Les sites supprimés sont conservés dans les archives.</p></div>
+  <div class="actions">
+  {% if not archived and me.role in ('admin','coordinateur','securite','dga') %}<a class="btn secondary" href="{{url_for('export_sites',format='xlsx')}}">Exporter Excel (avec agents)</a>{% endif %}
+  {% if not archived and me.role=='admin' %}<a class="btn secondary" href="{{url_for('import_sites')}}">Importer des sites</a>{% endif %}
   {% if me.role=='admin' %}<a class="btn secondary" href="{{url_for('sites',archived='0' if archived else '1')}}">{{'Voir les sites actifs' if archived else 'Voir les sites supprimés'}}</a>{% endif %}
+  </div>
 </div>
 {% if me.role in ('admin','coordinateur','securite') and not archived %}
 <section class="card"><h2>Ajouter un site</h2>
@@ -77,6 +84,108 @@ SITES_INLINE_TEMPLATE = r'''{% extends 'base.html' %}
 </td>
 </tr>{% else %}<tr><td colspan="9">Aucun site trouvé.</td></tr>{% endfor %}</tbody>
 </table></div></section>
+{% endblock %}
+'''
+
+
+# Rapport filtrable, autonome pour ne pas dépendre d'un ancien reports.html sur Render.
+REPORTS_INLINE_TEMPLATE = r'''{% extends 'base.html' %}{% block body %}
+<div class="headrow"><div><h1>Rapports des sites visités</h1>
+<p class="muted">Consultez les rapports des contrôleurs par date, site, contrôleur et statut. Cliquez sur « Voir le rapport » pour lire les échanges et la validation.</p></div></div>
+<section class="card"><form method="get" class="formgrid" style="align-items:end">
+<div class="field"><label>Date du</label><input type="date" name="start" value="{{start}}"></div>
+<div class="field"><label>Au</label><input type="date" name="end" value="{{end}}"></div>
+<div class="field"><label>Contrôleur</label><select name="controleur"><option value="">Tous les contrôleurs</option>{% for c in controllers %}<option value="{{c}}" {% if filtre_controleur==c %}selected{% endif %}>{{c}}</option>{% endfor %}</select></div>
+<div class="field"><label>Site / code</label><input name="site" value="{{filtre_site}}" placeholder="Nom ou code du site"></div>
+<div class="field"><label>Visite</label><select name="effected"><option value="1" {% if effected=='1' %}selected{% endif %}>Sites visités</option><option value="0" {% if effected=='0' %}selected{% endif %}>Non visités</option><option value="all" {% if effected=='all' %}selected{% endif %}>Toutes les déclarations</option></select></div>
+<div class="field"><label>Statut</label><select name="status"><option value="">Tous les statuts</option>{% for st in ['EN ATTENTE','VALIDÉE','REJETÉE'] %}<option value="{{st}}" {% if status==st %}selected{% endif %}>{{st}}</option>{% endfor %}</select></div>
+<div class="actions"><button class="btn">Afficher</button><button class="btn secondary" name="export" value="csv">Exporter les rapports CSV</button></div>
+</form></section>
+<div class="grid"><div class="stat"><span>Rapports affichés</span><strong>{{rows|length}}</strong></div><div class="stat"><span>Sites distincts</span><strong>{{rows|map(attribute='code')|unique|list|length}}</strong></div><div class="stat"><span>Validés</span><strong>{{rows|selectattr('status','equalto','VALIDÉE')|list|length}}</strong></div><div class="stat"><span>En attente</span><strong>{{rows|selectattr('status','equalto','EN ATTENTE')|list|length}}</strong></div></div>
+<section class="card"><h2>Rapports des contrôleurs</h2><p class="hint">L'effectif indiqué est l'effectif actuel du site, et non l'effectif à la date de visite. Les sites archivés restent présents dans l'historique. Maximum 5 000 résultats.</p>
+<div class="tablewrap"><table><thead><tr><th>Date</th><th>Code</th><th>Site</th><th>Agents actuels</th><th>Contrôleur</th><th>Saisi par</th><th>Visité</th><th>Observations</th><th>Statut</th><th>Validateur</th><th>Rapport</th></tr></thead><tbody>
+{% for r in rows %}<tr><td>{{r.visit_date}}</td><td><strong>{{r.code}}</strong></td><td>{{r.name}}</td><td>{{r.agents_actuels if r.agents_actuels is not none else '—'}}</td><td>{{r.controleur}}</td><td>{{r.saisi_par or '—'}}</td><td>{{'Oui' if r.effected else 'Non'}}</td><td class="wrap">{{r.observations}}</td><td>{{r.status}}</td><td>{{r.approver or '—'}}</td><td><a class="btn small secondary" href="{{url_for('visit_detail',vid=r.id)}}">Voir le rapport</a></td></tr>
+{% else %}<tr><td colspan="11">Aucun rapport ne correspond à ces filtres.</td></tr>{% endfor %}</tbody></table></div>
+</section>{% endblock %}'''
+
+IMPORT_INLINE_TEMPLATE = r'''{% extends 'base.html' %}{% block body %}
+<h1>Importer et exporter les sites avec leurs effectifs</h1>
+<p class="muted">Gérez les sites et le nombre d'agents dans un fichier Excel (.xlsx) ou CSV. L'import est réservé à l'administrateur.</p>
+<section class="card"><h2>1. Télécharger vos sites</h2><p>Export des sites actifs avec les codes, noms, zones, quartiers, responsables, clients, situations, nombres d'agents et observations.</p>
+<div class="actions"><a class="btn" href="{{url_for('export_sites',format='xlsx')}}">Exporter Excel (.xlsx)</a><a class="btn secondary" href="{{url_for('export_sites',format='csv')}}">Exporter CSV</a><a class="btn secondary" href="{{url_for('site_import_model')}}">Modèle CSV vierge</a></div></section>
+<section class="card"><h2>2. Importer les sites et effectifs</h2>
+<p>Modifiez le fichier exporté dans Excel, en conservant la colonne <strong>code</strong> (identifiant unique), la colonne <strong>nom</strong> et la colonne <strong>nombre_agents</strong>. Enregistrez et importez.</p>
+<form method="post" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{{csrf_token()}}"><div class="field"><label>Fichier Excel ou CSV (12 Mo maximum)</label><input type="file" name="file" accept=".xlsx,.csv,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required></div><div class="actions"><button class="btn">Importer et mettre à jour</button></div></form>
+<p class="hint">Un même code met à jour le site existant, sans dupliquer ses rapports. Une cellule d'effectif vide conserve l'effectif déjà enregistré. L'import ne supprime aucun site et ne réactive pas les sites archivés. Les modifications sont tracées.</p></section>{% endblock %}'''
+
+# Pages autonomes : utilisables même si les modèles du dépôt GitHub sont anciens.
+USERS_INLINE_TEMPLATE = r'''{% extends 'base.html' %}
+{% block body %}
+<h1>Gestion des utilisateurs</h1>
+<p class="muted">Chaque personne dispose de son propre accès. L'administrateur peut réinitialiser un mot de passe oublié sans consulter l'ancien.</p>
+{% if temporary_secret is defined %}
+<section class="card temp-password" role="status"><h2>Nouveau mot de passe provisoire</h2>
+<p>Compte concerné : <strong>{{reset_username}}</strong></p>
+<p class="secret-code">{{temporary_secret}}</p>
+<p><strong>Copiez ce mot de passe maintenant.</strong> Il ne sera plus affiché après avoir quitté cette page. Communiquez-le uniquement à son titulaire par un canal privé. Il devra le changer dès sa connexion.</p>
+<button type="button" class="btn secondary" onclick="navigator.clipboard.writeText(document.querySelector('.secret-code').textContent)">Copier le mot de passe</button>
+</section>
+{% endif %}
+<section class="card"><h2>Créer un utilisateur</h2>
+<form method="post"><input type="hidden" name="csrf" value="{{csrf_token()}}"><div class="formgrid">
+<div class="field"><label>Identifiant</label><input name="username" required></div>
+<div class="field"><label>Mot de passe (12 caractères minimum)</label><input name="password" type="password" minlength="12" required autocomplete="new-password"></div>
+<div class="field"><label>Rôle</label><select name="role">{% for value,label in roles.items() %}<option value="{{value}}">{{label}}</option>{% endfor %}</select></div>
+</div><div class="actions"><button class="btn">Créer le compte</button></div></form></section>
+<section class="card"><h2>Comptes existants</h2>
+<div class="tablewrap"><table><thead><tr><th>Identifiant</th><th>Rôle</th><th>Statut</th><th>Accès</th><th>Action</th></tr></thead><tbody>
+{% for u in users %}<tr><td><strong>{{u.username}}</strong></td><td>{{roles[u.role]}}</td><td>{{'Actif' if u.active else 'Inactif'}}</td>
+<td>{{'Changement obligatoire' if u.must_change_password else 'Normal'}}</td>
+<td>{% if u.active and u.id!=me.id %}<form method="post" action="{{url_for('user_reset_password',uid=u.id)}}" onsubmit="return confirm('Réinitialiser le mot de passe de {{u.username}} ?')"><input type="hidden" name="csrf" value="{{csrf_token()}}"><button class="btn small secondary">Réinitialiser le mot de passe</button></form>{% else %}—{% endif %}</td></tr>
+{% endfor %}</tbody></table></div></section>
+{% endblock %}
+'''
+
+LOGIN_INLINE_TEMPLATE = r'''{% extends 'base.html' %}{% block body %}<section class="card login">
+  <div style="text-align:center; margin-bottom:20px;">
+    <img
+      src="{{ url_for('static', filename='SABA O.png') }}"
+      alt="Logo GROUPE SABA SÉCURITÉ"
+      style="width:220px; max-width:100%; height:auto;"
+    >
+  </div>
+  <h1>Connexion sécurisée</h1><p class="muted">Accédez aux visites et rapports de GROUPE SABA SÉCURITÉ.</p><form method="post"><input type="hidden" name="csrf" value="{{csrf_token()}}"><div class="field"><label>Identifiant</label><input name="username" autocomplete="username" required autofocus></div><div class="field"><label>Mot de passe</label><input name="password" type="password" autocomplete="current-password" required></div><button class="btn">Se connecter</button></form><p class="hint" style="text-align:center;margin-top:18px"><a href="{{url_for('forgot_password')}}">Mot de passe oublié ?</a></p></section>{% endblock %}
+'''
+
+FORGOT_PASSWORD_INLINE_TEMPLATE = r'''{% extends 'base.html' %}{% block body %}
+<section class="card login"><h1>Mot de passe oublié ?</h1>
+<p>Contactez l'administrateur de GROUPE SABA SÉCURITÉ et demandez une <strong>réinitialisation de votre mot de passe</strong>.</p>
+<p class="muted">L'administrateur ouvrira « Utilisateurs » et vous remettra un mot de passe provisoire. À votre prochaine connexion, vous devrez le modifier.</p>
+{% if recovery_enabled %}<p>Vous êtes l'administrateur et avez perdu votre accès ? <a href="{{url_for('admin_emergency_recovery')}}">Utiliser la clé de secours</a>.</p>{% endif %}
+<p><a class="btn secondary" href="{{url_for('login')}}">Retour à la connexion</a></p></section>
+{% endblock %}
+'''
+
+ADMIN_RECOVERY_INLINE_TEMPLATE = r'''{% extends 'base.html' %}{% block body %}
+<section class="card login"><h1>Récupération administrateur</h1><p class="muted">Cette procédure nécessite la clé secrète ADMIN_RECOVERY_KEY configurée sur Render. Ne la communiquez jamais à un tiers.</p>
+<form method="post"><input type="hidden" name="csrf" value="{{csrf_token()}}">
+<div class="field"><label>Identifiant administrateur</label><input name="username" required></div>
+<div class="field"><label>Clé de secours</label><input name="recovery_key" type="password" required autocomplete="off"></div>
+<div class="field"><label>Nouveau mot de passe (12 caractères minimum)</label><input name="new_password" type="password" minlength="12" required autocomplete="new-password"></div>
+<div class="field"><label>Confirmer le mot de passe</label><input name="confirm_password" type="password" minlength="12" required autocomplete="new-password"></div>
+<button class="btn">Réinitialiser mon accès administrateur</button></form></section>
+{% endblock %}
+'''
+
+PASSWORD_INLINE_TEMPLATE = r'''{% extends 'base.html' %}
+{% block body %}
+<section class="card login"><h1>{{'Définir mon nouveau mot de passe' if forced else 'Changer mon mot de passe'}}</h1>
+{% if forced %}<p class="muted">Votre mot de passe provisoire doit être remplacé avant de poursuivre.</p>{% endif %}
+<form method="post"><input type="hidden" name="csrf" value="{{csrf_token()}}">
+{% if not forced %}<div class="field"><label>Ancien mot de passe</label><input name="old" type="password" autocomplete="current-password" required></div>{% endif %}
+<div class="field"><label>Nouveau mot de passe (12 caractères minimum)</label><input name="new" type="password" minlength="12" autocomplete="new-password" required></div>
+<div class="field"><label>Confirmer le nouveau mot de passe</label><input name="confirm" type="password" minlength="12" autocomplete="new-password" required></div>
+<button class="btn">Enregistrer le nouveau mot de passe</button></form></section>
 {% endblock %}
 '''
 
@@ -276,7 +385,7 @@ def login():
         if u and check_password_hash(u['password_hash'],request.form.get('password','')):
             session.clear();session['uid']=u['id'];token();return redirect(url_for('password' if u['must_change_password'] else 'dashboard'))
         flash('Identifiants incorrects.','danger')
-    return render_template('login.html')
+    return render_template_string(LOGIN_INLINE_TEMPLATE)
 
 @app.post('/logout')
 @login_required
@@ -628,16 +737,45 @@ def undo_validation(vid):
 @app.route('/reports')
 @login_required
 def reports():
-    start=request.args.get('start',date.today().replace(day=1).isoformat());end=request.args.get('end',date.today().isoformat())
-    try:date.fromisoformat(start);date.fromisoformat(end)
-    except ValueError:abort(400)
-    rows=many('''SELECT v.visit_date,s.code,s.name,s.agent_count agents_actuels,v.controleur,v.effected,v.observations,v.status,u.username approver,v.approved_at FROM visits v JOIN sites s ON s.id=v.site_id LEFT JOIN users u ON u.id=v.approved_by WHERE v.visit_date BETWEEN ? AND ? ORDER BY v.visit_date DESC,s.code''',(start,end))
+    start=request.args.get('start',date.today().replace(day=1).isoformat())
+    end=request.args.get('end',date.today().isoformat())
+    try:
+        if date.fromisoformat(start)>date.fromisoformat(end):raise ValueError('Dates inversées')
+    except ValueError:abort(400,'Période invalide.')
+    ctl=request.args.get('controleur','').strip()
+    site=request.args.get('site','').strip()
+    status=request.args.get('status','').strip()
+    effected=request.args.get('effected','1')
+    if effected not in ('0','1','all'):effected='1'
+    if status not in ('','EN ATTENTE','VALIDÉE','REJETÉE'):status=''
+    if len(ctl)>200 or len(site)>200:abort(400,'Filtre trop long.')
+    filters=['v.visit_date BETWEEN ? AND ?'];params=[start,end]
+    if current()['role']=='controleur':
+        filters.append('v.created_by=?');params.append(current()['id'])
+    if ctl:filters.append('v.controleur=?');params.append(ctl)
+    if site:
+        filters.append('(s.code LIKE ? OR s.name LIKE ?)')
+        params.extend([f'%{site}%',f'%{site}%'])
+    if status:filters.append('v.status=?');params.append(status)
+    if effected!='all':filters.append('v.effected=?');params.append(int(effected))
+    rows=many('''SELECT v.id,v.visit_date,s.code,s.name,s.agent_count agents_actuels,
+                       v.controleur,v.effected,v.observations,v.status,
+                       u.username approver,v.approved_at,creator.username saisi_par
+                FROM visits v JOIN sites s ON s.id=v.site_id
+                LEFT JOIN users u ON u.id=v.approved_by
+                LEFT JOIN users creator ON creator.id=v.created_by
+                WHERE '''+' AND '.join(filters)+''' ORDER BY v.visit_date DESC,v.id DESC LIMIT 5000''',params)
     if request.args.get('export')=='csv':
-        out=io.StringIO();w=csv.writer(out,delimiter=';');w.writerow(['Date','Code site','Nom site','Effectif actuel','Contrôleur','Effectuée','Observations','Statut','Validateur','Date validation'])
-        for r in rows:w.writerow([r[k] for k in r.keys()])
-        content='\ufeff'+out.getvalue()
-        return Response(content,mimetype='text/csv; charset=utf-8',headers={'Content-Disposition':'attachment; filename=rapport_saba.csv'})
-    return render_template('reports.html',rows=rows,start=start,end=end)
+        out=io.StringIO();w=csv.writer(out,delimiter=';')
+        w.writerow(['Date','Code site','Nom site','Effectif actuel','Contrôleur','Saisi par','Visité','Observations','Statut','Validateur','Date validation','N° rapport'])
+        for r in rows:
+            w.writerow([csv_safe(r[k]) for k in ('visit_date','code','name','agents_actuels','controleur','saisi_par','effected','observations','status','approver','approved_at','id')])
+        return Response('\ufeff'+out.getvalue(),mimetype='text/csv; charset=utf-8',headers={'Content-Disposition':'attachment; filename=rapports_controleurs_saba.csv','Cache-Control':'no-store'})
+    controller_filter = 'WHERE v.created_by=?' if current()['role']=='controleur' else ''
+    controller_params = (current()['id'],) if current()['role']=='controleur' else ()
+    controllers=[r['controleur'] for r in many('SELECT DISTINCT v.controleur FROM visits v '+controller_filter+' ORDER BY v.controleur',controller_params) if r['controleur']]
+    return render_template_string(REPORTS_INLINE_TEMPLATE,rows=rows,start=start,end=end,controllers=controllers,
+                                  filtre_controleur=ctl,filtre_site=site,effected=effected,status=status)
 
 @app.route('/users',methods=['GET','POST'])
 @role_required('admin')
@@ -651,7 +789,7 @@ def users():
                     cur=c.execute('INSERT INTO users(username,password_hash,role) VALUES(?,?,?)',(username,generate_password_hash(pwd),role));log(c,'CREATE','user',cur.lastrowid)
                 flash('Utilisateur créé.','success');return redirect(url_for('users'))
             except sqlite3.IntegrityError:flash('Identifiant déjà utilisé.','danger')
-    return render_template('users.html',users=many('SELECT id,username,role,active FROM users ORDER BY id'))
+    return render_template_string(USERS_INLINE_TEMPLATE,users=many('SELECT id,username,role,active,must_change_password FROM users ORDER BY id'))
 
 
 @app.post('/users/<int:uid>/reset-password')
@@ -668,14 +806,14 @@ def user_reset_password(uid):
         c.execute('''UPDATE users SET password_hash=?,must_change_password=1
                      WHERE id=?''',(generate_password_hash(temporary),uid))
         log(c,'RESET_PASSWORD','user',uid,'Réinitialisation par un administrateur')
-    response=app.make_response(render_template('users.html',users=many('SELECT id,username,role,active,must_change_password FROM users ORDER BY id'),
+    response=app.make_response(render_template_string(USERS_INLINE_TEMPLATE,users=many('SELECT id,username,role,active,must_change_password FROM users ORDER BY id'),
                      temporary_secret=temporary,reset_username=user['username']))
     response.headers['Cache-Control']='no-store, private'
     return response
 
 @app.route('/mot-de-passe-oublie')
 def forgot_password():
-    return render_template('forgot_password.html',recovery_enabled=len(os.environ.get('ADMIN_RECOVERY_KEY',''))>=32)
+    return render_template_string(FORGOT_PASSWORD_INLINE_TEMPLATE,recovery_enabled=len(os.environ.get('ADMIN_RECOVERY_KEY',''))>=32)
 
 @app.route('/recuperation-admin',methods=['GET','POST'])
 def admin_emergency_recovery():
@@ -699,7 +837,7 @@ def admin_emergency_recovery():
             session.clear()
             flash('Mot de passe administrateur remplacé. Connectez-vous.','success')
             return redirect(url_for('login'))
-    response=app.make_response(render_template('admin_recovery.html'))
+    response=app.make_response(render_template_string(ADMIN_RECOVERY_INLINE_TEMPLATE))
     response.headers['Cache-Control']='no-store, private'
     return response
 
@@ -722,30 +860,218 @@ def password():
                 log(c,'CHANGE_PASSWORD','user',me['id'])
             flash('Mot de passe modifié.','success')
             return redirect(url_for('dashboard'))
-    return render_template('password.html',forced=forced)
+    return render_template_string(PASSWORD_INLINE_TEMPLATE,forced=forced)
+
+# CSV et XLSX sans dépendance supplémentaire : compatibles avec Excel.
+SITE_COLUMNS=['code','nom','zone','quartier','responsable','client','situation','nombre_agents','observations']
+
+def csv_safe(value):
+    # Protéger les colonnes textuelles des formules CSV.
+    value='' if value is None else str(value)
+    if value.lstrip().startswith(('=','+','-','@','\t','\r','\n')):
+        return "'"+value
+    return value
+
+def site_export_rows():
+    rows=many('''SELECT s.code,s.name nom,z.name zone,s.quartier,s.responsable,s.client,
+                       s.situation,s.agent_count nombre_agents,s.observations
+                FROM sites s LEFT JOIN zones z ON z.id=s.zone_id
+                WHERE s.archived_at IS NULL ORDER BY s.code''')
+    return [[r[k] if r[k] is not None else '' for k in SITE_COLUMNS] for r in rows]
+
+def make_xlsx(headers,rows):
+    # Fichier xlsx autonome sans bibliothèque supplémentaire.
+    table=[headers]+rows
+    xrows=[]
+    for rownum,row in enumerate(table,1):
+        cells=[]
+        for colnum,val in enumerate(row):
+            col='';n=colnum+1
+            while n: n,rem=divmod(n-1,26);col=chr(65+rem)+col
+            address=f'{col}{rownum}'
+            if val is None:val=''
+            if isinstance(val,int) and not isinstance(val,bool):
+                cells.append(f'<c r="{address}"><v>{val}</v></c>')
+            else:
+                cells.append(f'<c r="{address}" t="inlineStr"><is><t xml:space="preserve">{xml_escape(str(val))}</t></is></c>')
+        xrows.append(f'<row r="{rownum}">'+''.join(cells)+'</row>')
+    lastcol='';n=len(headers)
+    while n:n,rem=divmod(n-1,26);lastcol=chr(65+rem)+lastcol
+    sheet='''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+    <sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>
+    <sheetFormatPr defaultRowHeight="16"/><cols><col min="1" max="2" width="23" customWidth="1"/><col min="3" max="9" width="20" customWidth="1"/></cols>
+    <sheetData>'''+''.join(xrows)+f'</sheetData><autoFilter ref="A1:{lastcol}{len(table)}"/></worksheet>'
+    out=io.BytesIO()
+    with zipfile.ZipFile(out,'w',compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr('[Content_Types].xml','''<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>''')
+        z.writestr('_rels/.rels','''<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>''')
+        z.writestr('xl/workbook.xml','''<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sites" sheetId="1" r:id="rId1"/></sheets></workbook>''')
+        z.writestr('xl/_rels/workbook.xml.rels','''<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>''')
+        z.writestr('xl/worksheets/sheet1.xml',sheet)
+    return out.getvalue()
+
+def parse_xlsx_rows(data):
+    ns={'m':'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        names=z.namelist()
+        if len(names)>250 or sum(x.file_size for x in z.infolist())>35*1024*1024:
+            raise ValueError('Fichier Excel trop volumineux.')
+        sheets=sorted(x for x in names if re.fullmatch(r'xl/worksheets/sheet\d+\.xml',x))
+        if not sheets:raise ValueError('Onglet Excel introuvable.')
+        strings=[]
+        if 'xl/sharedStrings.xml' in names:
+            shared=ET.fromstring(z.read('xl/sharedStrings.xml'))
+            strings=[''.join(t.text or '' for t in si.findall('.//m:t',ns)) for si in shared.findall('m:si',ns)]
+        root=ET.fromstring(z.read(sheets[0]))
+        result=[]
+        for row in root.findall('.//m:sheetData/m:row',ns):
+            values={}
+            for cell in row.findall('m:c',ns):
+                cellref=cell.get('r','');match=re.match(r'([A-Z]+)',cellref)
+                if not match:continue
+                index=0
+                for char in match.group(1):index=index*26+ord(char)-64
+                index-=1
+                t=cell.get('t','');v=cell.find('m:v',ns)
+                if t=='inlineStr':
+                    value=''.join(x.text or '' for x in cell.findall('.//m:t',ns))
+                elif t=='s':
+                    pos=int(v.text) if v is not None and v.text else -1
+                    value=strings[pos] if 0<=pos<len(strings) else ''
+                else:value=v.text if v is not None and v.text else ''
+                values[index]=value
+            if values:
+                result.append([values.get(k,'') for k in range(min(max(values)+1,40))])
+            if len(result)>10002:raise ValueError('Maximum 10 000 lignes par import.')
+        return result
+
+def normalize_header(raw):
+    txt=unicodedata.normalize('NFKD',str(raw or '')).encode('ascii','ignore').decode().lower()
+    key=re.sub(r'[^a-z0-9]','',txt)
+    aliases={'code':'code','codesite':'code','nom':'nom','name':'nom','nomsite':'nom','nomdusite':'nom',
+             'zone':'zone','quartier':'quartier','localisation':'quartier',
+             'responsable':'responsable','client':'client','situation':'situation',
+             'agents':'nombre_agents','nombreagents':'nombre_agents','nombreagent':'nombre_agents',
+             'nombredagents':'nombre_agents','agentsaffectes':'nombre_agents',
+             'effectif':'nombre_agents','effectifs':'nombre_agents','agentcount':'nombre_agents',
+             'observations':'observations','observation':'observations'}
+    return aliases.get(key)
+
+def import_table(data,filename):
+    if filename.lower().endswith('.xlsx'):
+        raw=parse_xlsx_rows(data)
+    else:
+        try:content=data.decode('utf-8-sig')
+        except UnicodeDecodeError:content=data.decode('cp1252')
+        try:dialect=csv.Sniffer().sniff(content[:4096],delimiters=';,\t')
+        except csv.Error:dialect=csv.excel
+        raw=list(csv.reader(io.StringIO(content),dialect=dialect))
+    if not raw:raise ValueError('Le fichier est vide.')
+    headers=[normalize_header(x) for x in raw[0]]
+    valid_headers=[x for x in headers if x]
+    if 'code' not in valid_headers or 'nom' not in valid_headers:
+        raise ValueError('Colonnes obligatoires : code et nom.')
+    if len(valid_headers)!=len(set(valid_headers)):
+        raise ValueError('Colonnes en double dans le fichier.')
+    parsed=[];seen=set();skipped=0
+    for line,values in enumerate(raw[1:],2):
+        if line>10002:raise ValueError('Maximum 10 000 lignes par import.')
+        fields={h:str(values[i]).strip() for i,h in enumerate(headers) if h and i<len(values)}
+        if not any(fields.values()):skipped+=1;continue
+        code=fields.get('code','').upper();name=fields.get('nom','')
+        if not code or not name or len(code)>80 or len(name)>200:
+            raise ValueError(f'Ligne {line} : code et nom obligatoires (80 et 200 caractères maximum).')
+        if code in seen:raise ValueError(f'Ligne {line} : code {code} présent plusieurs fois.')
+        seen.add(code);fields['code']=code
+        if 'nombre_agents' in fields and fields['nombre_agents']!='':
+            try:n=Decimal(fields['nombre_agents'].replace(',','.'))
+            except InvalidOperation:raise ValueError(f'Ligne {line} : nombre d’agents invalide.')
+            if not n.is_finite() or n!=n.to_integral_value() or n<0 or n>10000:
+                raise ValueError(f'Ligne {line} : effectif de 0 à 10 000 requis.')
+            fields['nombre_agents']=int(n)
+        if 'situation' in fields and fields['situation'] and fields['situation'] not in ('ACTIF','INACTIF'):
+            raise ValueError(f'Ligne {line} : situation doit être ACTIF ou INACTIF.')
+        parsed.append(fields)
+    with conn() as c:
+        added=0;updated=0;agents_changed=0
+        now=datetime.now().isoformat(timespec='seconds')
+        for data in parsed:
+            code=data['code'];existing=c.execute('SELECT * FROM sites WHERE code=?',(code,)).fetchone()
+            if existing and existing['archived_at']:
+                raise ValueError(f'Site {code} archivé : restaurez-le manuellement avant import.')
+            zone_id=None
+            if data.get('zone'):
+                zone=c.execute('SELECT id FROM zones WHERE name=?',(data['zone'],)).fetchone()
+                if not zone:
+                    cur=c.execute('INSERT INTO zones(name,created_at) VALUES(?,?)',(data['zone'],now))
+                    zone_id=cur.lastrowid
+                    log(c,'CREATE','zone',zone_id,'Création lors de l’import des sites')
+                else:zone_id=zone['id']
+            if existing:
+                updates={'name':data['nom']}
+                for col in ('quartier','responsable','client','situation','observations'):
+                    if data.get(col):updates[col]=data[col]
+                if zone_id is not None:updates['zone_id']=zone_id
+                if isinstance(data.get('nombre_agents'),int):
+                    if data['nombre_agents']!=existing['agent_count']:
+                        updates.update(agent_count=data['nombre_agents'],agent_count_updated_at=now,agent_count_updated_by=current()['id'])
+                        agents_changed+=1
+                        log(c,'EFFECTIF','site',existing['id'],json.dumps({'avant':existing['agent_count'],'apres':data['nombre_agents'],'source':'import'},ensure_ascii=False))
+                columns=','.join(f'{x}=?' for x in updates)
+                c.execute(f'UPDATE sites SET {columns} WHERE id=?',[*updates.values(),existing['id']])
+                updated+=1
+            else:
+                values={'code':code,'name':data['nom'],'zone_id':zone_id,
+                        'quartier':data.get('quartier',''),'responsable':data.get('responsable',''),
+                        'client':data.get('client',''),'situation':data.get('situation') or 'ACTIF',
+                        'observations':data.get('observations',''),'created_at':now}
+                if isinstance(data.get('nombre_agents'),int):
+                    values.update(agent_count=data['nombre_agents'],agent_count_updated_by=current()['id'],agent_count_updated_at=now)
+                    agents_changed+=1
+                cols=','.join(values);ph=','.join('?' for _ in values)
+                cursor=c.execute(f'INSERT INTO sites({cols}) VALUES({ph})',list(values.values()))
+                log(c,'CREATE','site',cursor.lastrowid,'Import de sites')
+                added+=1
+        log(c,'IMPORT','sites',0,json.dumps({'ajoutes':added,'actualises':updated,'effectifs':agents_changed},ensure_ascii=False))
+    return added,updated,agents_changed,skipped
+
+@app.get('/sites/export')
+@role_required('admin','coordinateur','securite','dga')
+def export_sites():
+    fmt=request.args.get('format','xlsx')
+    if fmt not in ('xlsx','csv'):abort(400,'Format inconnu.')
+    rows=site_export_rows()
+    if fmt=='xlsx':
+        content=make_xlsx(SITE_COLUMNS,rows)
+        return Response(content,mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                        headers={'Content-Disposition':'attachment; filename=sites_effectifs_groupe_saba.xlsx','Cache-Control':'no-store'})
+    out=io.StringIO();writer=csv.writer(out,delimiter=';');writer.writerow(SITE_COLUMNS)
+    for row in rows:writer.writerow([csv_safe(x) for x in row])
+    return Response('\ufeff'+out.getvalue(),mimetype='text/csv; charset=utf-8',
+                    headers={'Content-Disposition':'attachment; filename=sites_effectifs_groupe_saba.csv','Cache-Control':'no-store'})
+
+@app.get('/sites/modele-import')
+@role_required('admin')
+def site_import_model():
+    return Response('\ufeff'+';'.join(SITE_COLUMNS)+'\r\n',mimetype='text/csv; charset=utf-8',
+                    headers={'Content-Disposition':'attachment; filename=modele_import_sites_saba.csv','Cache-Control':'no-store'})
 
 @app.route('/import',methods=['GET','POST'])
 @role_required('admin')
 def import_sites():
     if request.method=='POST':
-        f=request.files.get('file');count=0;skipped=0
-        if not f or not f.filename.lower().endswith('.csv'):flash('Utilisez un fichier CSV UTF-8.','danger')
+        f=request.files.get('file')
+        if not f or not f.filename or not f.filename.lower().endswith(('.csv','.xlsx')):
+            flash('Veuillez sélectionner un fichier Excel (.xlsx) ou CSV (.csv).','danger')
         else:
             try:
-                content=f.read().decode('utf-8-sig');sample=content[:4096]
-                dialect=csv.Sniffer().sniff(sample,delimiters=';,\t')
-                reader=csv.DictReader(io.StringIO(content),dialect=dialect)
-                if not {'code','nom'}.issubset(set(reader.fieldnames or [])):raise ValueError('Colonnes obligatoires : code, nom')
-                with conn() as c:
-                    for row in reader:
-                        code=row.get('code','').strip().upper();name=row.get('nom','').strip()
-                        if not code or not name:skipped+=1;continue
-                        c.execute('''INSERT INTO sites(code,name,quartier,responsable,client,situation,observations,created_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(code) DO UPDATE SET name=excluded.name,quartier=excluded.quartier,responsable=excluded.responsable,client=excluded.client,situation=excluded.situation,observations=excluded.observations''',(code,name,row.get('quartier',''),row.get('responsable',''),row.get('client',''),row.get('situation','ACTIF') or 'ACTIF',row.get('observations',''),datetime.now().isoformat(timespec='seconds')))
-                        count+=1
-                    log(c,'IMPORT','sites',0,f'{count} lignes')
-                flash(f'{count} sites importés ou mis à jour ; {skipped} lignes ignorées.','success')
-            except Exception as e:flash(f'Import impossible : {str(e)[:150]}','danger')
-    return render_template('import.html')
+                added,updated,agents,skipped=import_table(f.read(),f.filename)
+                flash(f'Import réussi : {added} site(s) ajouté(s), {updated} site(s) mis à jour, {agents} effectif(s) modifié(s), {skipped} ligne(s) vide(s) ignorée(s).','success')
+                return redirect(url_for('import_sites'))
+            except (ValueError,UnicodeError,zipfile.BadZipFile,ET.ParseError,sqlite3.Error) as e:
+                flash(f'Import refusé sans modification : {str(e)[:230]}','danger')
+    return render_template_string(IMPORT_INLINE_TEMPLATE)
 
 @app.route('/health')
 def health():return {'status':'ok'}

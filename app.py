@@ -51,6 +51,21 @@ def init_db():
         ''')
         existing={r['name'] for r in c.execute('PRAGMA table_info(sites)')}
         if 'zone_id' not in existing:c.execute('ALTER TABLE sites ADD COLUMN zone_id INTEGER REFERENCES zones(id)')
+        # Migration additive, sans écraser la base utilisée sur Render.
+        for col,definition in (
+            ('agent_count','INTEGER'),
+            ('agent_count_updated_at','TEXT'),
+            ('agent_count_updated_by','INTEGER'),
+            ('archived_at','TEXT'),
+            ('archived_by','INTEGER'),
+            ('archive_reason','TEXT')
+        ):
+            if col not in existing:c.execute(f'ALTER TABLE sites ADD COLUMN {col} {definition}')
+        user_columns={r['name'] for r in c.execute('PRAGMA table_info(users)')}
+        if 'must_change_password' not in user_columns:
+            c.execute('ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0')
+        if 'password_changed_at' not in user_columns:
+            c.execute('ALTER TABLE users ADD COLUMN password_changed_at TEXT')
 
 def all_zones():return many('SELECT id,name FROM zones ORDER BY name')
 
@@ -95,7 +110,7 @@ def many(query,args=()):
 
 def current():
     if not session.get('uid'):return None
-    return one('SELECT id,username,role FROM users WHERE id=? AND active=1',(session['uid'],))
+    return one('SELECT id,username,role,must_change_password FROM users WHERE id=? AND active=1',(session['uid'],))
 
 def login_required(fn):
     @wraps(fn)
@@ -121,6 +136,16 @@ def token():
 @app.before_request
 def check_csrf():
     if request.method=='POST' and not secrets.compare_digest(request.form.get('csrf',''),token()):abort(400,'Jeton de sécurité invalide. Actualisez la page.')
+
+@app.before_request
+def require_new_password():
+    # Un mot de passe temporaire doit être remplacé avant toute autre action.
+    if request.endpoint in ('static','password','logout','login','setup','forgot_password','admin_emergency_recovery'):
+        return None
+    if session.get('uid'):
+        user=current()
+        if user and user['must_change_password']:
+            return redirect(url_for('password'))
 
 @app.context_processor
 def context():
@@ -183,7 +208,7 @@ def login():
     if request.method=='POST':
         u=one('SELECT * FROM users WHERE username=? AND active=1',(request.form.get('username','').strip(),))
         if u and check_password_hash(u['password_hash'],request.form.get('password','')):
-            session.clear();session['uid']=u['id'];token();return redirect(url_for('dashboard'))
+            session.clear();session['uid']=u['id'];token();return redirect(url_for('password' if u['must_change_password'] else 'dashboard'))
         flash('Identifiants incorrects.','danger')
     return render_template('login.html')
 
@@ -196,7 +221,7 @@ def logout():session.clear();return redirect(url_for('login'))
 def dashboard():
     year=request.args.get('year',str(date.today().year))
     if not year.isdigit() or len(year)!=4:year=str(date.today().year)
-    stats=one('''SELECT (SELECT COUNT(*) FROM sites) sites,(SELECT COUNT(*) FROM visits WHERE substr(visit_date,1,4)=?) total,(SELECT COUNT(*) FROM visits WHERE substr(visit_date,1,4)=? AND status='VALIDÉE') validated,(SELECT COUNT(*) FROM visits WHERE status='EN ATTENTE') pending,(SELECT COUNT(DISTINCT site_id) FROM visits WHERE substr(visit_date,1,4)=? AND status='VALIDÉE') covered''',(year,year,year))
+    stats=one('''SELECT (SELECT COUNT(*) FROM sites WHERE archived_at IS NULL) sites, (SELECT COALESCE(SUM(agent_count),0) FROM sites WHERE archived_at IS NULL AND situation='ACTIF') agents, (SELECT COUNT(*) FROM sites WHERE archived_at IS NULL AND agent_count IS NULL) sites_sans_effectif,(SELECT COUNT(*) FROM visits WHERE substr(visit_date,1,4)=?) total,(SELECT COUNT(*) FROM visits WHERE substr(visit_date,1,4)=? AND status='VALIDÉE') validated,(SELECT COUNT(*) FROM visits WHERE status='EN ATTENTE') pending,(SELECT COUNT(DISTINCT site_id) FROM visits WHERE substr(visit_date,1,4)=? AND status='VALIDÉE') covered''',(year,year,year))
     monthly=many('''SELECT substr(visit_date,6,2) month, COUNT(*) total, SUM(CASE WHEN status='VALIDÉE' THEN 1 ELSE 0 END) valid FROM visits WHERE substr(visit_date,1,4)=? GROUP BY month ORDER BY month''',(year,))
     recent=many('''SELECT v.*,s.code,s.name,u.username approver FROM visits v JOIN sites s ON s.id=v.site_id LEFT JOIN users u ON u.id=v.approved_by ORDER BY v.id DESC LIMIT 12''')
     return render_template('dashboard.html',stats=stats,monthly={int(r['month']):r for r in monthly},recent=recent,year=year)
@@ -293,14 +318,21 @@ def sites():
                 flash('Site enregistré.','success');return redirect(url_for('sites'))
             except sqlite3.IntegrityError:flash('Ce code site existe déjà.','danger')
     q=request.args.get('q','').strip()
-    rows=many('SELECT s.*,z.name zone_name FROM sites s LEFT JOIN zones z ON z.id=s.zone_id WHERE s.code LIKE ? OR s.name LIKE ? ORDER BY s.code LIMIT 1000',(f'%{q}%',f'%{q}%'))
-    return render_template('sites.html',sites=rows,q=q,zones=all_zones())
+    archived=request.args.get('archived')=='1' and current()['role']=='admin'
+    rows=many('''SELECT s.*,z.name zone_name,u.username agents_updated_by,
+                    (SELECT COUNT(*) FROM visits v WHERE v.site_id=s.id) visits_count
+                 FROM sites s LEFT JOIN zones z ON z.id=s.zone_id
+                 LEFT JOIN users u ON u.id=s.agent_count_updated_by
+                 WHERE (s.code LIKE ? OR s.name LIKE ?) AND s.archived_at IS '''+('NOT NULL' if archived else 'NULL')+
+               ' ORDER BY s.code LIMIT 1000',(f'%{q}%',f'%{q}%'))
+    return render_template('sites.html',sites=rows,q=q,zones=all_zones(),archived=archived)
 
 @app.route('/sites/<int:sid>/edit',methods=['GET','POST'])
 @role_required('admin','coordinateur','securite')
 def site_edit(sid):
     s=one('SELECT * FROM sites WHERE id=?',(sid,))
     if not s:abort(404)
+    if s['archived_at']:abort(409,'Ce site est archivé. Restaurez-le avant modification.')
     if request.method=='POST':
         try:
             with conn() as c:
@@ -309,6 +341,69 @@ def site_edit(sid):
             flash('Site mis à jour.','success');return redirect(url_for('sites'))
         except sqlite3.IntegrityError:flash('Code déjà utilisé.','danger')
     return render_template('site_edit.html',s=s,zones=all_zones())
+
+
+@app.post('/sites/<int:sid>/agents')
+@role_required('admin', *APPROVERS)
+def update_site_agents(sid):
+    value=request.form.get('agent_count','').strip()
+    if not value.isdecimal() or len(value)>5 or int(value)>10000:
+        flash('Indiquez un nombre d’agents compris entre 0 et 10 000.','danger')
+        return redirect(url_for('sites'))
+    with conn() as c:
+        site=c.execute('SELECT code,agent_count,archived_at FROM sites WHERE id=?',(sid,)).fetchone()
+        if not site:abort(404)
+        if site['archived_at']:abort(409,'Ce site est archivé.')
+        new_value=int(value)
+        c.execute('''UPDATE sites SET agent_count=?,agent_count_updated_by=?,agent_count_updated_at=?
+                     WHERE id=? AND archived_at IS NULL''',
+                  (new_value,current()['id'],datetime.now().isoformat(timespec='seconds'),sid))
+        log(c,'EFFECTIF','site',sid,json.dumps({'avant':site['agent_count'],'apres':new_value},ensure_ascii=False))
+    flash(f'Effectif du site {site["code"]} enregistré : {new_value} agent(s).','success')
+    return redirect(url_for('sites'))
+
+@app.post('/sites/<int:sid>/archive')
+@role_required('admin')
+def site_archive(sid):
+    if request.form.get('confirm')!='SUPPRIMER':abort(400,'Confirmation obligatoire.')
+    motif=request.form.get('motif','').strip()
+    if not motif or len(motif)>500:abort(400,'Indiquez un motif (500 caractères maximum).')
+    with conn() as c:
+        site=c.execute('SELECT * FROM sites WHERE id=?',(sid,)).fetchone()
+        if not site:abort(404)
+        if site['archived_at']:abort(409,'Site déjà retiré du répertoire actif.')
+        c.execute('''UPDATE sites SET archived_at=?,archived_by=?,archive_reason=? WHERE id=?''',
+                  (datetime.now().isoformat(timespec='seconds'),current()['id'],motif,sid))
+        log(c,'ARCHIVE','site',sid,json.dumps({'site':dict(site),'motif':motif},ensure_ascii=False))
+    flash('Site supprimé du répertoire actif. Les rapports sont préservés et le site peut être restauré.','success')
+    return redirect(url_for('sites'))
+
+@app.post('/sites/<int:sid>/restore')
+@role_required('admin')
+def site_restore(sid):
+    with conn() as c:
+        site=c.execute('SELECT code,archived_at FROM sites WHERE id=?',(sid,)).fetchone()
+        if not site:abort(404)
+        if not site['archived_at']:abort(409,'Site non archivé.')
+        c.execute('UPDATE sites SET archived_at=NULL,archived_by=NULL,archive_reason=NULL WHERE id=?',(sid,))
+        log(c,'RESTORE','site',sid)
+    flash('Site restauré.','success')
+    return redirect(url_for('sites',archived='1'))
+
+@app.post('/sites/<int:sid>/delete-permanently')
+@role_required('admin')
+def site_delete_permanently(sid):
+    if request.form.get('confirm')!='EFFACER':abort(400,'Confirmation obligatoire.')
+    with conn() as c:
+        site=c.execute('SELECT * FROM sites WHERE id=?',(sid,)).fetchone()
+        if not site:abort(404)
+        if not site['archived_at']:abort(409,'Archivez d’abord le site.')
+        visits=c.execute('SELECT COUNT(*) AS n FROM visits WHERE site_id=?',(sid,)).fetchone()['n']
+        if visits:abort(409,'Ce site possède des rapports de visite : suppression définitive interdite.')
+        log(c,'DELETE','site',sid,json.dumps(dict(site),ensure_ascii=False))
+        c.execute('DELETE FROM sites WHERE id=?',(sid,))
+    flash('Site définitivement supprimé : aucun rapport de visite n’était lié.','success')
+    return redirect(url_for('sites',archived='1'))
 
 def create_visit_records(form):
     site_ids=form.getlist('site_ids') or [form.get('site_id','')]
@@ -325,7 +420,7 @@ def create_visit_records(form):
     if len(obs)>10000 or len(ctl)>200:raise ValueError('Texte trop long.')
     with conn() as c:
         ph=','.join('?' for _ in ids)
-        n=c.execute(f"SELECT COUNT(*) FROM sites WHERE id IN ({ph}) AND situation='ACTIF'",ids).fetchone()[0]
+        n=c.execute(f"SELECT COUNT(*) FROM sites WHERE id IN ({ph}) AND situation='ACTIF' AND archived_at IS NULL",ids).fetchone()[0]
         if n!=len(ids):raise ValueError('Site inconnu ou inactif.')
         for sid in ids:
             cur=c.execute('INSERT INTO visits(site_id,visit_date,controleur,effected,observations,created_by,created_at) VALUES(?,?,?,?,?,?,?)',
@@ -354,7 +449,7 @@ def visits():
     if day:where.append('v.visit_date=?');params.append(day)
     if site:where.append('(s.code LIKE ? OR s.name LIKE ?)');params.extend([f'%{site}%',f'%{site}%'])
     rows=many('''SELECT v.*,s.code,s.name,u.username approver FROM visits v JOIN sites s ON s.id=v.site_id LEFT JOIN users u ON u.id=v.approved_by WHERE '''+' AND '.join(where)+' ORDER BY v.visit_date DESC,v.id DESC LIMIT 1000',params)
-    return render_template('visits.html',visits=rows,sites=many("SELECT id,code,name FROM sites WHERE situation='ACTIF' ORDER BY code"),filters={'status':status,'date':day,'site':site})
+    return render_template('visits.html',visits=rows,sites=many("SELECT id,code,name FROM sites WHERE situation='ACTIF' AND archived_at IS NULL ORDER BY code"),filters={'status':status,'date':day,'site':site})
 
 @app.route('/visits/declarer-plusieurs',methods=['GET','POST'])
 @role_required('admin','coordinateur','securite','dga','controleur')
@@ -365,7 +460,7 @@ def visit_multiple():
         else:
             flash(f'{n} visites distinctes enregistrées.','success')
             return redirect(url_for('visits'))
-    sites_list=many("SELECT s.id,s.code,s.name,z.name zone_name FROM sites s LEFT JOIN zones z ON z.id=s.zone_id WHERE s.situation='ACTIF' ORDER BY z.name,s.code")
+    sites_list=many("SELECT s.id,s.code,s.name,z.name zone_name FROM sites s LEFT JOIN zones z ON z.id=s.zone_id WHERE s.situation='ACTIF' AND s.archived_at IS NULL ORDER BY z.name,s.code")
     return render_template('visit_multiple.html',sites=sites_list)
 
 @app.route('/visits/<int:vid>/edit',methods=['GET','POST'])
@@ -380,7 +475,7 @@ def visit_edit(vid):
         when=request.form.get('visit_date','')
         eff=request.form.get('effected','1')
         obs=request.form.get('observations','').strip()
-        if not sid.isdigit() or not one("SELECT id FROM sites WHERE id=? AND situation='ACTIF'",(sid,)):
+        if not sid.isdigit() or not one("SELECT id FROM sites WHERE id=? AND situation='ACTIF' AND archived_at IS NULL",(sid,)):
             flash('Site invalide.','danger')
         elif eff not in ('0','1') or len(obs)>10000:
             flash('Saisie invalide.','danger')
@@ -395,7 +490,7 @@ def visit_edit(vid):
                 if not result.rowcount:abort(409,'Visite devenue non modifiable.')
                 flash('Visite modifiée.','success')
                 return redirect(url_for('visit_detail',vid=vid))
-    sites_list=many("SELECT id,code,name FROM sites WHERE situation='ACTIF' OR id=? ORDER BY code",(v['site_id'],))
+    sites_list=many("SELECT id,code,name FROM sites WHERE (situation='ACTIF' AND archived_at IS NULL) OR id=? ORDER BY code",(v['site_id'],))
     return render_template('visit_edit.html',v=v,sites=sites_list)
 
 @app.post('/visits/<int:vid>/delete')
@@ -470,9 +565,9 @@ def reports():
     start=request.args.get('start',date.today().replace(day=1).isoformat());end=request.args.get('end',date.today().isoformat())
     try:date.fromisoformat(start);date.fromisoformat(end)
     except ValueError:abort(400)
-    rows=many('''SELECT v.visit_date,s.code,s.name,v.controleur,v.effected,v.observations,v.status,u.username approver,v.approved_at FROM visits v JOIN sites s ON s.id=v.site_id LEFT JOIN users u ON u.id=v.approved_by WHERE v.visit_date BETWEEN ? AND ? ORDER BY v.visit_date DESC,s.code''',(start,end))
+    rows=many('''SELECT v.visit_date,s.code,s.name,s.agent_count agents_actuels,v.controleur,v.effected,v.observations,v.status,u.username approver,v.approved_at FROM visits v JOIN sites s ON s.id=v.site_id LEFT JOIN users u ON u.id=v.approved_by WHERE v.visit_date BETWEEN ? AND ? ORDER BY v.visit_date DESC,s.code''',(start,end))
     if request.args.get('export')=='csv':
-        out=io.StringIO();w=csv.writer(out,delimiter=';');w.writerow(['Date','Code site','Nom site','Contrôleur','Effectuée','Observations','Statut','Validateur','Date validation'])
+        out=io.StringIO();w=csv.writer(out,delimiter=';');w.writerow(['Date','Code site','Nom site','Effectif actuel','Contrôleur','Effectuée','Observations','Statut','Validateur','Date validation'])
         for r in rows:w.writerow([r[k] for k in r.keys()])
         content='\ufeff'+out.getvalue()
         return Response(content,mimetype='text/csv; charset=utf-8',headers={'Content-Disposition':'attachment; filename=rapport_saba.csv'})
@@ -492,17 +587,76 @@ def users():
             except sqlite3.IntegrityError:flash('Identifiant déjà utilisé.','danger')
     return render_template('users.html',users=many('SELECT id,username,role,active FROM users ORDER BY id'))
 
+
+@app.post('/users/<int:uid>/reset-password')
+@role_required('admin')
+def user_reset_password(uid):
+    if uid==current()['id']:
+        flash('Pour votre propre compte, utilisez « Mot de passe ».','danger')
+        return redirect(url_for('users'))
+    temporary=secrets.token_urlsafe(18)
+    with conn() as c:
+        user=c.execute('SELECT username,active FROM users WHERE id=?',(uid,)).fetchone()
+        if not user:abort(404)
+        if not user['active']:abort(409,'Compte inactif.')
+        c.execute('''UPDATE users SET password_hash=?,must_change_password=1
+                     WHERE id=?''',(generate_password_hash(temporary),uid))
+        log(c,'RESET_PASSWORD','user',uid,'Réinitialisation par un administrateur')
+    response=app.make_response(render_template('users.html',users=many('SELECT id,username,role,active,must_change_password FROM users ORDER BY id'),
+                     temporary_secret=temporary,reset_username=user['username']))
+    response.headers['Cache-Control']='no-store, private'
+    return response
+
+@app.route('/mot-de-passe-oublie')
+def forgot_password():
+    return render_template('forgot_password.html',recovery_enabled=len(os.environ.get('ADMIN_RECOVERY_KEY',''))>=32)
+
+@app.route('/recuperation-admin',methods=['GET','POST'])
+def admin_emergency_recovery():
+    recovery_key=os.environ.get('ADMIN_RECOVERY_KEY','')
+    if len(recovery_key)<32:abort(404,'Récupération administrateur non configurée.')
+    if request.method=='POST':
+        username=request.form.get('username','').strip()
+        provided=request.form.get('recovery_key','')
+        pwd=request.form.get('new_password','')
+        # Même message pour éviter de divulguer l'existence d'un compte administrateur.
+        user=one("SELECT id FROM users WHERE username=? AND role='admin' AND active=1",(username,))
+        if not secrets.compare_digest(provided,recovery_key) or not user:
+            flash('Informations de récupération incorrectes.','danger')
+        elif len(pwd)<12 or pwd!=request.form.get('confirm_password',''):
+            flash('Mot de passe de 12 caractères minimum et confirmation identique obligatoires.','danger')
+        else:
+            with conn() as c:
+                c.execute('UPDATE users SET password_hash=?,must_change_password=0,password_changed_at=? WHERE id=?',
+                          (generate_password_hash(pwd),datetime.now().isoformat(timespec='seconds'),user['id']))
+                log(c,'RECOVERY_PASSWORD','user',user['id'],'Clé de secours administrateur')
+            session.clear()
+            flash('Mot de passe administrateur remplacé. Connectez-vous.','success')
+            return redirect(url_for('login'))
+    response=app.make_response(render_template('admin_recovery.html'))
+    response.headers['Cache-Control']='no-store, private'
+    return response
+
 @app.route('/password',methods=['GET','POST'])
 @login_required
 def password():
+    me=current()
+    forced=bool(me['must_change_password'])
     if request.method=='POST':
-        u=one('SELECT password_hash FROM users WHERE id=?',(current()['id'],))
-        if not check_password_hash(u['password_hash'],request.form.get('old','')):flash('Ancien mot de passe incorrect.','danger')
-        elif len(request.form.get('new',''))<12:flash('12 caractères minimum.','danger')
+        u=one('SELECT password_hash FROM users WHERE id=?',(me['id'],))
+        new=request.form.get('new','')
+        if not forced and not check_password_hash(u['password_hash'],request.form.get('old','')):
+            flash('Ancien mot de passe incorrect.','danger')
+        elif len(new)<12 or new!=request.form.get('confirm',''):
+            flash('Choisissez 12 caractères minimum et confirmez le nouveau mot de passe.','danger')
         else:
-            with conn() as c:c.execute('UPDATE users SET password_hash=? WHERE id=?',(generate_password_hash(request.form['new']),current()['id']))
-            flash('Mot de passe modifié.','success');return redirect(url_for('dashboard'))
-    return render_template('password.html')
+            with conn() as c:
+                c.execute('''UPDATE users SET password_hash=?,must_change_password=0,password_changed_at=? WHERE id=?''',
+                          (generate_password_hash(new),datetime.now().isoformat(timespec='seconds'),me['id']))
+                log(c,'CHANGE_PASSWORD','user',me['id'])
+            flash('Mot de passe modifié.','success')
+            return redirect(url_for('dashboard'))
+    return render_template('password.html',forced=forced)
 
 @app.route('/import',methods=['GET','POST'])
 @role_required('admin')
